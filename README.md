@@ -105,7 +105,8 @@ pixtreme-train train config.yaml --output runs/first
 `train(config, output, *, resume=None)` runs the same operation from Python and
 returns the last checkpoint path. The output must be a new directory. A run
 writes `config.yaml` with resolved defaults, `environment.json`, numbered JSONL
-segments under `records/`, the completed run's `training.jsonl`, and
+segments under `records/`, a consolidated `training.jsonl` when the run
+completes or stops on the first signal (not when it fails), and
 `checkpoint_XXXXXXXX.pt` files. Updates record their loss/metrics and learning
 rates. Evaluations add reports under the run directory.
 
@@ -124,9 +125,19 @@ passed to the selected component. `schedulers.<optimizer-name>` can select
 `{type: warmup_cosine, warmup: 100, minimum: 0.0}`; the runner supplies the total
 iteration count. `ema: {decay: 0.999}` enables averaged evaluation weights.
 
+To decay from the initial learning rate without warmup, select
+`{type: warmup_cosine, warmup: 0, minimum: 0.2}`. The coefficient starts at `1.0`
+before any update and reaches `minimum` after the total number of updates;
+positive warmup lengths retain linear warmup followed by cosine decay.
+The warmup length must be nonnegative and less than the total iteration count,
+and `minimum` must be between `0` and `1`, inclusive. Invalid settings are
+rejected before training starts. The scheduler counts completed updates and
+continues from the saved count when resuming a checkpoint.
+
 | `train` key | Behavior/default |
 | --- | --- |
-| `iterations`, `seed`, `device`, `checkpoint_interval` | Required. Iteration and checkpoint intervals are positive; seed is nonnegative. |
+| `iterations`, `device`, `checkpoint_interval` | Required. Iteration and checkpoint intervals are positive. |
+| `seed` | Optional nonnegative integer. Omit the key to choose a random seed once when starting a new run; `null` is rejected. The actual seed is saved in `config.yaml` and each checkpoint's configuration. Reuse that saved configuration to repeat the run. |
 | `precision` | `bf16` by default, or `fp32`. Parameters and optimizer state remain float32. |
 | `channels_last` | Boolean, default `false`; stores all networks' 4D weights and 4D tensor inputs in channels_last order, including EMA evaluation inputs. Shapes and values are unchanged. Video tensors with five or more dimensions keep their existing layout. |
 | `cudnn_benchmark` | Boolean, default `false`; enables cuDNN convolution algorithm benchmarking during training and restores the caller's flag on success or failure. When false, the caller's flag is left alone. |
@@ -141,9 +152,48 @@ iteration count. `ema: {decay: 0.999}` enables averaged evaluation weights.
 names report the available names. Extend `TrainingStep`, or `DefaultStep` for a
 compatible supervised model, to own model-specific updates, state or evaluation.
 Network classes and steps can implement `check_config`; steps can implement
-`check_resume`. A custom dataset receives `seed` and `device`, resolves its own
+`check_resume`. Steps can also override these optional, default no-op methods:
+
+- `initialize(self)` runs once after step construction for a **fresh** training
+  call, before data is supplied or any update runs. Load initial model weights
+  here and initialize any EMA or model-specific averaged weights together. Load
+  tensors into the existing network objects so optimizer parameters stay attached.
+  Resume calls `load_state_dict` instead and never calls `initialize`.
+- `check_checkpoint(cls, saved)` is a classmethod receiving the complete,
+  format-checked checkpoint, including `saved["config"]` and `saved["step"]`.
+  Validate model-specific records here and raise `ValueError` identifying the
+  record and reason when they are missing or inconsistent. This method runs on
+  resume before step construction and on network extraction, export and
+  calibration before applying weights. It must not mutate `saved` or construct
+  training resources. Inference never constructs the training step or optimizer.
+
+Move fresh-only weight file reads from constructors and `check_config` into
+`initialize`. A resumed run can then continue after that initial file is removed;
+the resolved configuration can keep its original path. Keep configuration shape
+checks in `check_config`, comparisons between the saved and requested
+configurations in `check_resume(cls, saved_config, requested_config)`, and instance
+state restoration in `load_state_dict(self, state)`. Implement model record checks
+once in `check_checkpoint` so resume and inference share the same interpretation.
+
+A custom dataset receives `seed` and `device`, resolves its own
 configuration through an optional `resolve_config` method, and can provide paired
 `state_dict`/`load_state_dict` methods and `close` for lifecycle management.
+
+A dataset that assembles complete batches can implement
+`batch_sampler(generator, completed, *, batch_size)`. The runner passes the
+resolved `train.batch_size` and the number of completed updates (`0` for a new
+run). The sampler yields indices for the dataset's `__getitem__`, whose result
+is passed directly to the update without another collation. Random material
+choices should use the supplied torch generator; derive sample numbers from
+`completed` and `batch_size` so resuming continues from the completed batch.
+Batch size remains in `train`; `data.train.batch_size` is rejected.
+
+Existing `batch_sampler(generator, completed)` implementations keep their
+two-argument call and batch behavior. To receive the shared size, add an explicit
+`batch_size` parameter accepting a keyword (as above, or as a regular parameter).
+Accepting only `**kwargs` does not opt in, and uninspectable callables retain the
+two-argument call. Dataset factories and data types without a batch sampler
+keep their existing inputs and behavior.
 
 A custom dataset used with `sample_threads > 1` must support concurrent
 `__getitem__` calls, protect shared mutable state and derive random choices from
@@ -184,7 +234,10 @@ named `gt.steps` and `lq.steps`; `to_mapping()` returns the resolved description
 Steps include `color`, `resize`, `compression_artifacts`, the registered blur and
 noise operations, and a value-free `crop` marker. `compression_artifacts` models
 intraframe compression through pixtreme; temporal HEVC belongs in the video data
-configuration. A custom degradation operation supplies `validate(parameters,
+configuration. `compression_artifacts` applies to the values it receives as they
+are, without color conversion or clipping, so place a `color` step such as
+`{colorspace: Rec.709, gamma: sRGB}` before it; otherwise the simulated codec
+sees ACES2065-1/linear values, including values outside 0 to 1. A custom degradation operation supplies `validate(parameters,
 location)` and `apply(frame, values, *, stream)`, with optional `scale` and `unit`
 geometry attributes.
 
@@ -253,6 +306,65 @@ JSON files. These datasets produce TCHW float32 GPU clips. A model-specific
 training/evaluation step must handle the temporal dimension and model state;
 the default image step does not adapt a video model automatically.
 
+For whole-video evaluation, choose `video_stream_evaluation`. The model's
+evaluation step opens each material with `with dataset.stream(material) as samples:`.
+It receives every selected display frame once, including a short final delivery.
+The source decoder, encoder and LQ decoder stay in one stream for that material;
+changing `frames` only changes delivery boundaries. Crop coordinates and
+compression settings are drawn once per material from its seed and material index.
+
+| Evaluation data key or operation | `video_evaluation` / `VideoEvaluationDataset` | `video_stream_evaluation` / `VideoStreamEvaluationDataset` |
+| --- | --- | --- |
+| `frames` (default `1`) | Length of each independent clip; incomplete tails are dropped. | Maximum frames per delivery; the entire tail is returned, including materials shorter than `frames`. |
+| `frame_step`, `time_range` | Select eligible complete clips. | Select display frames in the half-open time range, then take every `frame_step` frame starting at its first eligible frame. |
+| `gop_aligned` | Every clip starts at a source keyframe. | Only the material's first selected frame is advanced to the first eligible source keyframe. |
+| `crop_size`, `temporal_compression` | Draw a crop and codec settings per clip; each clip is an independent compressed stream. | Draw once per material; the crop, references, frame types and timing persist across deliveries. |
+| `len(dataset)` | Number of complete clips. | Number of materials in `paths`. |
+| Reading | `dataset[clip_index]`, including repeated random access. | `with dataset.stream(material_index) as samples:` followed by ordered iteration. Each context opens a fresh stream. |
+
+Both evaluation types reject augmentation and scene mixing and support the RGB
+and optional YCbCr LQ paths. Other keys keep the meanings in the video data table
+below. The existing `video_evaluation` behavior and defaults are unchanged.
+
+```python
+from pixtreme.train.common import VideoStreamEvaluationDataset
+
+dataset = VideoStreamEvaluationDataset(
+    paths=["source.mov"], frames=5, seed=17, device="cuda",
+    temporal_compression={"gop_length": 10, "frame_types": True},
+)
+try:
+    for material in range(len(dataset)):
+        with dataset.stream(material) as samples:
+            for sample in samples:
+                # TCHW CUDA tensors: sample["gt"] and sample["lq"].
+                # Reset the model on LQ I frames and accumulate metrics per frame.
+                prediction = evaluate_video_frames(sample)
+finally:
+    dataset.close()
+```
+
+`evaluate_video_frames` represents the caller's model evaluation. The model's
+`TrainingStep.evaluate(..., context=...)` opens the stream contexts, including
+when this data type is selected under `data.evaluation` in YAML. The runner
+unwinds that method on a training signal. Use each context and its iterator on
+the same thread. Exiting the context, even after `break` or an exception,
+releases its source, encoder and LQ decoder without reading the remainder.
+GPU retention covers delivery buffers and codec delay; the source is decoded
+as the consumer advances. Only compressed bytes and timing/container metadata
+pass through the CPU. Delivered tensors remain valid after context exit.
+Callers retain those tensors for as long as they need them.
+
+Stream samples carry the same fields, color, exact `pts`/`time_base`, source
+`frame_numbers` and float `times` as video clips. `index` identifies the material
+and `number` counts deliveries within it. `continuous` and source-based `reset`
+continue across delivery boundaries; a boundary alone does not reset the model.
+When compression requests `frame_types`, `frame_type` describes the continuous
+LQ stream (B=`0`, P=`1`, I=`2`). The evaluation step selects model resets and
+metric aggregation. An empty selected range is diagnosed before evaluation.
+The existing source format, GPU and codec capability requirements also apply
+to this data type.
+
 | Video data key | Default/meaning |
 | --- | --- |
 | `frames`, `scale`, `frame_step` | `1`, `1`, `1`; clip length, spatial reduction, and source-frame stride. |
@@ -263,8 +375,46 @@ the default image step does not adapt a video model automatically.
 | `augment` | `false`; evaluation requires `false`. Transpose must preserve batch dimensions. |
 | `colorspace`, `gamma` | `Rec.709`, `Rec.709`; RGB output color. Source color comes from video metadata. |
 | `temporal_compression` | `null`, or a HEVC settings mapping as below. |
+| `lq_resize` | `rgb`; `ycbcr` selects source YCbCr reduction before encoder conversion and requires `temporal_compression`. Applies to training and evaluation. |
+| `index_paths` | Optional mapping from entries in `paths` to index JSON destinations. Omit it to keep rebuilding video paths without saving indexes. Available for training and evaluation. |
 | `patch_size` | Training only: `null` (return the entire prepared clip), or final GT patch size divisible by `scale`. Patches are cut after temporal compression. When set, it must fit `crop_size` and every source. |
 | `patches_per_clip` | Training only: `1`; positive integer number of consecutive samples from each decoded/compressed clip. Values above `1` require `patch_size`. Independent of `train.batch_size`; a clip's samples may span batches. |
+
+To reuse indexes across starts, choose a destination for each video. The names
+and directories belong to the caller; the foundation does not impose a cache
+filename. Destination directories must already exist. For a source named
+`training.mov`, set `index_paths: {training.mov: .training.mov.index.json}` in
+its data entry, as in the training example below. Sources omitted from the
+mapping are scanned without saving an index.
+
+Only new videos and videos with missing, unreadable, unsupported or mismatched
+indexes are scanned with `ffprobe`. Correspondence uses the resolved source
+path, byte size, and modification time floored to whole seconds. Differences
+within the same second also remain accepted by subsequent reads and resume.
+Changing the path, size, whole-second modification time or indexed frame timing
+still prevents resuming with different material. Removed videos' caches are
+unused. Indexes are fully written and synced to a sibling temporary file before
+replacement. Save failures warn with the source, destination and reason, then
+continue with the freshly built in-memory index. An index destination must
+differ from its source video.
+
+Direct callers use the same behavior through
+`VideoIndex.build(source, cache_path=destination)`. Without `cache_path`, `build`
+always scans and does not save. `VideoIndex.save(destination)` also uses complete
+file replacement, but reports save errors to its caller. `VideoIndex.load(path)`
+loads a saved index without scanning and reports errors rather than rebuilding.
+Existing version 2 JSON indexes remain readable. Version 1 indexes lack
+container color metadata and require rebuilding: pass the original video and
+destination to `build`, or use video paths with `index_paths`. Passing an old
+JSON file directly in `paths` reports its unsupported format.
+
+Video data state remains version 1. New fingerprints normalize the source
+modification time to whole seconds and retain the full indexed metadata and
+timing. Older exact-nanosecond fingerprints are accepted when their original
+version 2 index reproduces the saved fingerprint. Keep that index when resuming
+an older checkpoint; if it has been rebuilt with different fractional seconds
+and no longer matches, start a new run. No index or checkpoint is silently
+reinterpreted as a different material.
 
 `crop_size` keeps its existing meaning: it selects the GT region before LQ
 reduction and temporal compression. `patch_size` selects a smaller region after
@@ -272,6 +422,31 @@ those operations, then applies each sample's augmentation to every field and
 frame. A patch's coordinates and size must align with every field's pixel grid.
 With `patch_size: null` and `patches_per_clip: 1`, pixels, sample records, and
 random choices are unchanged.
+
+To reduce source YCbCr without passing the LQ pixels through RGB, set
+`lq_resize: ycbcr` in the video data entry and enable `temporal_compression`.
+The reader preserves the source PixelBuffer's format, bit depth and color
+declarations. On the GPU, pixtreme's `from_pixel_buffer` expands it to a float32
+YCbCr Frame, `transform.resize` applies area reduction, and `to_pixel_buffer`
+converts once to the encoder input. Source primaries, transfer, matrix, range
+and chroma position govern unpacking; the selected output color, matrix, range,
+bit depth and left chroma position govern the encoder input and its HEVC
+declaration. Chroma is interpolated while expanding subsampled source pixels to
+a Frame. This route does not retain the source plane grids during reduction.
+GT and decoded LQ remain RGB in the configured `colorspace`/`gamma`. Crops still
+precede reduction; patches and augmentation still follow compression. The
+default `lq_resize: rgb` retains the existing RGB conversion and reduction.
+This option requires pixtreme's public `from_pixel_buffer`, `transform.resize`
+and `to_pixel_buffer` interfaces; it is supported with pixtreme 2.27.5.
+
+Supported version-two RGB checkpoints written before `lq_resize` was added
+retain their implicit `rgb` meaning, for both training and evaluation data.
+They can resume with the option omitted or explicitly set to `rgb`. Resume
+compares data options through the registered data type's configuration resolver,
+including the existing single-patch defaults. Changing between `rgb` and
+`ycbcr` changes preprocessing and is rejected on resume; two otherwise matching
+`ycbcr` configurations remain compatible. Checkpoint files and saved training
+states are preserved during this comparison.
 
 For example, to produce 16 separate GT 128 / LQ 64 samples from one prepared
 512-pixel GT clip, merge these fields into your training configuration. This
@@ -284,6 +459,7 @@ data:
   train:
     type: video
     paths: [training.mov]
+    index_paths: {training.mov: .training.mov.index.json}
     frames: 10
     scale: 2
     crop_size: 512
@@ -398,15 +574,41 @@ missing references and native decoder errors still raise `RuntimeError`.
 This applies to clips encoded internally by temporal compression. Source video
 readers also use the decoder's default mode without analysis.
 
-Direct Python operations include `VideoIndex.build/save/load`, `VideoFrame`,
+Direct Python operations include `VideoIndex.build(source, *, cache_path=None)`,
+`VideoIndex.save/load`, `VideoFrame`,
 `ClipSampler`/`ClipSelection`, `VideoField`/`VideoSample`,
-`VideoClipReader.read/close`, and `VideoDataset`/`VideoEvaluationDataset`.
+`VideoClipReader.read/close`, and
+`VideoDataset`/`VideoEvaluationDataset`/`VideoStreamEvaluationDataset`.
+`VideoClipReader.read_pictures(selection)` returns source PixelBuffers in the
+selection's display order, preserving their format, declarations and code bits.
+The selection retains exact PTS/time_base correspondence. Each picture owns a
+GPU copy, so it remains usable after another read or `close()`; callers release
+the returned pictures when finished. The method uses the same bounded source
+decoder sessions as `read`.
 `TemporalCompression.resolve_config` validates settings without running codecs;
 `select(generator)` returns scalar settings, `validate(...)` checks capabilities,
 and `apply(lq, generator, *, frame_rate, ...)` returns fields and chosen settings.
 `encode_hevc(lq, parameters, *, frame_rate, colorspace="Rec.709", gamma="Rec.709")`
 encodes a nonempty TCHW floating CUDA RGB tensor to Annex B HEVC bytes. Pass
 settings from `TemporalCompression(...).select(generator)`.
+`encode_hevc_pictures(pictures, parameters, *, frame_rate, scale=1, crops=None,
+colorspace="Rec.709", gamma="Rec.709")` accepts a nonempty sequence of source
+PixelBuffers on one GPU. `scale` is a positive integer divisor of the selected
+dimensions. Optional `crops` has one `(top, left, height, width)` or `None` per
+picture, in source luma coordinates; resulting dimensions must match. The call
+expands YCbCr, crops and reduces it on the GPU, then uses the same NVENC
+submission/drain/close loop as `encode_hevc`. `TemporalCompression.apply` also
+accepts these pictures with `scale` and `crops`, returning decoded RGB fields
+and selected settings through the same LQ decoder sessions. For example:
+
+```python
+pictures = reader.read_pictures(selection)
+fields, chosen = compression.apply(
+    pictures, generator, frame_rate=frame_rate, scale=2,
+    colorspace="Rec.709", gamma="Rec.709",
+)
+```
+
 `decode_hevc(source, *, device=0, motion_vectors=False, residuals=False,
 frame_types=False)` accepts HEVC bytes or a file path and returns `DecodedLQFrame`
 objects in display order; `device` is the CUDA device index.
@@ -429,6 +631,41 @@ dtype conversion yourself. `FrameMetrics`, `MaterialMetrics` and
 `EvaluationMetrics` preserve per-frame results and aggregate by frame count;
 `json_metric` represents positive infinity as `"Infinity"` for strict JSON and
 rejects NaN/negative infinity.
+
+Use `frame_from_tensor(values, color)` from `pixtreme.train.common` to pass a
+network output to the common metrics. `values` must be a CUDA `torch.float32`
+RGB tensor with shape `(3, height, width)` and positive dimensions. Contiguous
+tensors and noncontiguous CHW views are accepted; split batches and video clips
+into individual images before calling. `color` must specify `colorspace`
+(primaries) and `gamma` (transfer) using pixtreme's supported color names. The
+function copies the values on the same GPU without changing color, normalizing,
+or clipping, including values outside `[0, 1]`. CPU tensors, other dtypes,
+incompatible shapes and missing or unsupported color names raise `ValueError`.
+Network outputs with `requires_grad=True` are accepted. The evaluation copy
+does not track gradients; the original tensor's autograd state is preserved.
+
+```python
+from pixtreme.train.common import frame_from_tensor, measure
+
+color = {"colorspace": "Rec.709", "gamma": "sRGB"}
+# reference and prediction are CHW float32 CUDA tensors produced on the current stream.
+reference_frame = frame_from_tensor(reference, color)
+prediction_frame = frame_from_tensor(prediction, color)
+metrics = measure(0, reference_frame, prediction_frame)
+```
+
+The copy uses the current torch stream for the tensor's device and keeps
+temporary tensor storage alive until the copy completes, including storage
+borrowed through DLPack. The function waits for the copy to finish before
+returning the Frame. When another stream
+produces the tensor, order it with `torch.cuda.current_stream(values.device).wait_stream(producer)`
+before calling. The returned Frame owns its pixels independently of later
+source writes ordered after the copy. The default evaluation step uses the
+same operation. Noise degradation and color clipping with
+`value_clipping="color_and_metrics"` also wait for their tensor-to-Frame copies.
+Callers using the private `_frames._from_tensor` should import
+`frame_from_tensor` from `pixtreme.train.common`; the private name remains an
+alias to the same implementation. `rgb_frame` continues to accept Frames.
 
 `measure` requires a CUDA device and stream; CPU-only tests that substitute
 Frames and metrics must substitute `measure` itself.
@@ -457,6 +694,8 @@ runs in float32, and restores the network's previous training mode.
 named network in eval mode, preferring EMA and falling back to training weights
 when that network has no EMA. Import the trainer's registration module first.
 The checkpoint's configuration describes its data, colors and clipping policy.
+The registered step's `check_checkpoint` validates model records first; rejected
+records never become an inference network or a published weight artifact.
 
 `export_weights(checkpoint, output, *, name="main", ema=True, metadata,
 transform=None)` writes a new artifact directory containing `weights.safetensors`
@@ -466,6 +705,9 @@ completed update count. `metadata` must declare positive integer `scale`,
 `value_clipping`. Optional `transform(state_dict)` converts tensor names/values
 before tensoracle writes safetensors. The artifact contains inference weights,
 not optimizer, RNG or resumable training state.
+Export and calibration deserialize the source checkpoint once and share that
+validated content for weight selection and provenance. The SHA256 is computed
+from the same open source file before deserialization.
 
 `calibrate(checkpoint, output, *, materials, preprocess, preprocessing, targets,
 infer_low_precision, metadata, ...)` also writes scales, provenance, and
@@ -496,7 +738,7 @@ The following helpers are also public for custom training steps:
 | `rng_state(*, device=None, generators=None)` / `restore_rng_state(state, *, device=None, generators=None)` | Capture/restore Python, NumPy, torch CPU, optional CUDA and named torch generators; restoration validates all streams first. |
 | `NumberedSampler(size, generator, *, start=0)` | Yields `(global_sample_number, random_material_index)` with replacement. `sample_generator(seed, number)` supplies that sample's NumPy generator. `EndlessSampler(size, generator)` draws uniform material indices with replacement from the supplied torch generator. |
 | `image_paths(directory, *, prefixes=())` | Lists supported direct child images in filename order, rejecting an empty selection. `augment_images(images, *, hflip, vflip, transpose)` applies matching spatial transforms to a mapping of tensors. |
-| `warmup_cosine_factor(completed, *, warmup, total, minimum)` | Returns the linear-warmup/cosine-decay learning rate coefficient. |
+| `warmup_cosine_factor(completed, *, warmup, total, minimum)` | Returns the learning rate coefficient for `completed` updates. Set `warmup=0` for cosine decay from `1.0` at zero updates to `minimum` at `total`; positive warmup lengths first increase the coefficient linearly. Requires `0 <= warmup < total` and `0 <= minimum <= 1`. |
 | `update_ema(average, model, *, decay)` | Averages floating state and copies nonfloating state. `check_finite_loss(loss, *, iteration)` and `check_finite_gradients(parameters)` reject nonfinite values; finite gradients are not clipped. |
 | `release_gpu_memory(device)` | Returns unused torch and CuPy allocator blocks for a CUDA device. |
 | `training_signals()` | Context manager exposing the first interruption to the training loop and escalating a second signal. `worker_signals(worker_id)` configures a DataLoader worker; `stop_loader_workers(iterator)` requests shutdown, waits up to five seconds and reaps survivors. |
@@ -516,6 +758,9 @@ without converting checkpoint weights. Model
 steps may further restrict resumption. The next sample follows the last completed
 update; unused prefetched samples are regenerated.
 
+An omitted `train.seed` on resume uses the seed saved in the checkpoint and does
+not choose a new one. An explicitly supplied seed must match the saved value.
+
 The same sources, configuration, environment and seed reproduce material/sample
 selection and preprocessing random choices. Bitwise identity of model updates
 across GPUs, library versions or arithmetic modes is not promised. Codecs can
@@ -526,7 +771,12 @@ The first SIGINT/SIGTERM stops new batch production, finishes an in-progress
 update, and saves the last completed state. No checkpoint is written before the
 first completed update or when no update has advanced since the last checkpoint.
 An interrupted evaluation does not become a successful report. A second signal
-exits without waiting for saving.
+exits without waiting for saving. The first signal also consolidates
+`training.jsonl` in the same format as normal completion, containing only
+completed updates and completed evaluations. Before the first completed update,
+the file is empty. Incomplete updates are excluded, and an interrupted
+evaluation contributes no evaluation values or report. A second signal skips
+this consolidation when it has not started and can interrupt it in progress.
 
 ### Migration from 0.3.x
 
@@ -648,6 +898,7 @@ data:
       lq:
         steps:
           - crop
+          - color: {colorspace: Rec.709, gamma: sRGB}
           - compression_artifacts:
               quality: 80
               subsampling: "4:2:0"
