@@ -128,9 +128,12 @@ iteration count. `ema: {decay: 0.999}` enables averaged evaluation weights.
 | --- | --- |
 | `iterations`, `seed`, `device`, `checkpoint_interval` | Required. Iteration and checkpoint intervals are positive; seed is nonnegative. |
 | `precision` | `bf16` by default, or `fp32`. Parameters and optimizer state remain float32. |
+| `channels_last` | Boolean, default `false`; stores all networks' 4D weights and 4D tensor inputs in channels_last order, including EMA evaluation inputs. Shapes and values are unchanged. Video tensors with five or more dimensions keep their existing layout. |
+| `cudnn_benchmark` | Boolean, default `false`; enables cuDNN convolution algorithm benchmarking during training and restores the caller's flag on success or failure. When false, the caller's flag is left alone. |
+| `compile` | `null` by default, or a [torch.compile mode](https://docs.pytorch.org/docs/stable/generated/torch.compile.html): `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`. Compiles each registered network's forward; checkpoint, EMA and exported weight names stay unchanged. Initial compilation takes time and may use additional memory. |
 | `batch_size` | Positive integer, default `1`. |
-| `prefetch_batches` | Nonnegative integer, default `0`; bounds queued and in-progress batches together. |
-| `sample_threads` | Positive integer, default `1`; builds samples within each batch in threads in the training process. Samples are returned in sampler order; different batches are not submitted together. |
+| `prefetch_batches` | Nonnegative integer, default `0`; bounds queued and in-progress batches together, including batches whose sample reads are pending. Zero creates only the batch being requested. Grouped video reads may also retain the unused tail of one clip, as described below. |
+| `sample_threads` | Positive integer, default `1`; builds samples in threads in the training process, preserving sampler order. With prefetch, reads from different batches share the same pool within the prefetch bound for datasets without `state_dict` and for standard video identity state. Custom mutable state keeps reads parallel within each batch. |
 | `evaluation_interval` | Required and positive when `data.evaluation` is nonempty. |
 
 `register(kind, name)(component)` and `lookup(kind, name)` support `network`,
@@ -146,8 +149,13 @@ A custom dataset used with `sample_threads > 1` must support concurrent
 `__getitem__` calls, protect shared mutable state and derive random choices from
 the seed and sample number. Its checkpoint state must be independent of sample
 completion order. Datasets supplying `batch_sampler` continue to return complete
-batches sequentially. A sample failure retains its exception type and adds the
-sample number through the exception's `__notes__`; the CLI prints those notes.
+batches sequentially. Cross-batch reads are enabled only when the dataset has no
+`state_dict`, or its `state_dict` is the standard `VideoDataset` implementation
+(including subclasses that inherit it unchanged). Other datasets with
+`state_dict` finish each batch before submitting the next, so their checkpoint
+state excludes unused future samples. A sample failure retains its exception
+type and adds the batch and sample numbers through the exception's `__notes__`;
+the CLI prints those notes.
 
 ### Image data and degradation
 
@@ -256,7 +264,7 @@ the default image step does not adapt a video model automatically.
 | `colorspace`, `gamma` | `Rec.709`, `Rec.709`; RGB output color. Source color comes from video metadata. |
 | `temporal_compression` | `null`, or a HEVC settings mapping as below. |
 | `patch_size` | Training only: `null` (return the entire prepared clip), or final GT patch size divisible by `scale`. Patches are cut after temporal compression. When set, it must fit `crop_size` and every source. |
-| `patches_per_clip` | Training only: `1`; positive integer number of separate samples from each decoded/compressed clip. Values above `1` require `patch_size`. `train.batch_size` must be divisible by this count. |
+| `patches_per_clip` | Training only: `1`; positive integer number of consecutive samples from each decoded/compressed clip. Values above `1` require `patch_size`. Independent of `train.batch_size`; a clip's samples may span batches. |
 
 `crop_size` keeps its existing meaning: it selects the GT region before LQ
 reduction and temporal compression. `patch_size` selects a smaller region after
@@ -266,8 +274,8 @@ With `patch_size: null` and `patches_per_clip: 1`, pixels, sample records, and
 random choices are unchanged.
 
 For example, to produce 16 separate GT 128 / LQ 64 samples from one prepared
-512-pixel GT clip, merge these fields into your training configuration. Set
-`train.batch_size` to 16, or another multiple of 16:
+512-pixel GT clip, merge these fields into your training configuration. This
+example uses `train.batch_size: 16`; a smaller or nondivisible batch size works too:
 
 ```yaml
 train:
@@ -290,12 +298,29 @@ settings. Patch positions and horizontal/vertical flips and transposition are
 chosen per sample; patches may overlap. Sharing clips reduces material/time and
 compression diversity within each batch. The source clip is decoded once and
 LQ is compressed once per group. `train.sample_threads` runs different groups
-concurrently; thread count and prefetch do not change sample choices. Numbered
+concurrently, including groups from subsequent batches within
+`train.prefetch_batches`; thread count and prefetch do not change sample choices. Numbered
 sample `n` belongs to clip `n // patches_per_clip` and patch
 `n % patches_per_clip`. The group's first material draw chooses its clip; the
 runner consumes the other material draws too, preserving sampler progress.
-Groups stay within one batch, and resume rebuilds any unused prefetched groups
-from the last completed update. No prepared clip is cached across batches.
+The runner takes consecutive samples from this sequence to fill each batch,
+retaining the rest of a clip for the following batch. For example, batch 16
+with `patches_per_clip: 32`, or batch 10 with `patches_per_clip: 20`, splits
+one clip across two batches. Batch 8 with `patches_per_clip: 12` places the
+next clip's boundary inside the second batch. Each clip is decoded and
+compressed once during uninterrupted training.
+
+The number of created or in-progress samples not yet delivered in a batch is
+bounded by `max(1, train.prefetch_batches) * train.batch_size + patches_per_clip - 1`.
+The extra `patches_per_clip - 1` allows the unused tail of one clip; sample
+threads, pending reads and retained patches are reclaimed on every exit.
+Resume rebuilds the clip containing the first unused patch and any later
+prefetched clips, skipping patches already used by completed updates. Inside
+a clip, checkpoint `rng.generators.sampler` records the generator state before
+that clip's first material draw; `iteration * train.batch_size % patches_per_clip`
+identifies the used patch count. At a clip boundary, that generator state is
+before the next clip's first draw. The checkpoint format and video data state
+version are unchanged. Resume requires the same batch size and patch count.
 
 When `patch_size` is set, sample records additionally contain `clip_number`,
 `patch_number`, `patch_crop` (top, left, height, width in the prepared GT clip),
@@ -366,6 +391,13 @@ transforms adjust their direction and magnitude. Frame type codes are B=`0`,
 P=`1`, I=`2`. `transform_video_fields` applies corresponding spatial transforms
 to image, vector, scalar and frame fields.
 
+Temporal compression enables NVDEC analysis only when `motion_vectors` or
+`residuals` is requested. Pictures and frame types alone skip that work. Without
+analysis, `faulty_reference` and `missing_slices` metadata are unavailable;
+missing references and native decoder errors still raise `RuntimeError`.
+This applies to clips encoded internally by temporal compression. Source video
+readers also use the decoder's default mode without analysis.
+
 Direct Python operations include `VideoIndex.build/save/load`, `VideoFrame`,
 `ClipSampler`/`ClipSelection`, `VideoField`/`VideoSample`,
 `VideoClipReader.read/close`, and `VideoDataset`/`VideoEvaluationDataset`.
@@ -378,6 +410,8 @@ settings from `TemporalCompression(...).select(generator)`.
 `decode_hevc(source, *, device=0, motion_vectors=False, residuals=False,
 frame_types=False)` accepts HEVC bytes or a file path and returns `DecodedLQFrame`
 objects in display order; `device` is the CUDA device index.
+This standalone operation always enables analysis and raises `RuntimeError` for
+missing or faulty references and missing slices, even when no byproducts are requested.
 
 Call `close()` on a directly constructed video reader or dataset when finished.
 The training runner closes data resources on completion, error and signal stop.
@@ -472,9 +506,13 @@ pixtreme-train train config.yaml --output runs/continued --resume runs/first/che
 ```
 
 Resume permits changes to `train.iterations` (must exceed completed updates),
-`train.device`, `train.sample_threads`, and `notes`. Other settings must match the
+`train.device`, `train.sample_threads`, `train.channels_last`,
+`train.cudnn_benchmark`, `train.compile`, and `notes`. Other settings must match the
 saved configuration, including data sources, degradation, color, batch size and
-prefetch depth. Version 2 checkpoints lacking `sample_threads` use `1`. Model
+prefetch depth. Version 2 checkpoints lacking `sample_threads` use `1`; missing
+network execution options mean `channels_last: false`, `cudnn_benchmark: false`,
+and `compile: null`. These options may change on resume in either direction
+without converting checkpoint weights. Model
 steps may further restrict resumption. The next sample follows the last completed
 update; unused prefetched samples are regenerated.
 
