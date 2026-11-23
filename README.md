@@ -567,7 +567,7 @@ Numeric settings accept a scalar, an inclusive range (`[min, max]` or
 | `vbv_buffer_size` | `null`: encoder default; otherwise an integer from `1` to `4294967295` bits, corresponding to FFmpeg's `-bufsize`. VBV initial delay stays at the encoder default. |
 | `subsampling`, `bit_depth` | `4:2:0` and `8`; also `4:2:2`/`4:4:4` and `10` where both GPU codecs support them. Use `choices` for disjoint bit depths. |
 | `matrix`, `range` | `BT.709`, `legal`; matrices also accept `BT.601`/`BT.2020`, ranges also accept `full`. |
-| `frame_rate` | `null`: source average display rate divided by `frame_step`; a positive rational such as `"30000/1001"` overrides it. One-frame sources require an explicit rate. |
+| `frame_rate` | `null`: source average display rate divided by `frame_step`; a positive rational such as `"30000/1001"` overrides it. For one-frame sources, the rate is the reciprocal of the frame's packet duration in seconds, divided by `frame_step`. A missing or nonpositive duration requires an explicit rate. |
 | `motion_vectors`, `residuals`, `frame_types` | `false`; request `mv`, `residual`, `frame_type` GPU fields. |
 
 Omitting `references` or `vbv_buffer_size`, or setting either to `null`, preserves
@@ -623,6 +623,27 @@ decoder sessions as `read`.
 `TemporalCompression.resolve_config` validates settings without running codecs;
 `select(generator)` returns scalar settings, `validate(...)` checks capabilities,
 and `apply(lq, generator, *, frame_rate, ...)` returns fields and chosen settings.
+
+`TemporalCompression.close()` releases every LQ decoder session retained by
+`apply`, including sessions opened by other sample threads. It is safe before
+the first `apply` and on repeated calls; a later `apply` opens a new session as
+needed. A custom data type that owns this component forwards cleanup from its
+own `close()` method:
+
+```python
+from pixtreme.train.common import TemporalCompression
+
+class CustomVideoData:
+    def __init__(self):
+        self.temporal_compression = TemporalCompression({"gop_length": 10})
+
+    def close(self):
+        self.temporal_compression.close()
+```
+
+Call the custom data type's `close()` when sample work finishes, including on
+errors. `VideoDataset.close()` already closes its temporal compression component.
+
 `encode_hevc(lq, parameters, *, frame_rate, colorspace="Rec.709", gamma="Rec.709")`
 encodes a nonempty TCHW floating CUDA RGB tensor to Annex B HEVC bytes. Pass
 settings from `TemporalCompression(...).select(generator)`.
