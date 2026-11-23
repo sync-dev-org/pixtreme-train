@@ -35,6 +35,7 @@ The `export` extra adds `tensoracle[convert]>=2.6.1`.
 | Video indexing and packet demux | The `ffprobe` command on `PATH`, with support for the source container and codec. |
 | Video source decoding | `pixtreme-transport-nvdec` and a GPU/driver supporting the actual codec, chroma layout, bit depth and dimensions. Unsupported sources are rejected; source decoding has no CPU fallback. |
 | `temporal_compression`, `encode_hevc` | `pixtreme-transport-nvenc`, HEVC NVENC support (NVENC API 13.0, driver R580 or later), and NVDEC support for the selected encoded format. Source and compressed LQ decoding use the same process. |
+| Compressed evaluation LQ export (`stream(..., lq_path=...)`) | The `ffmpeg` command on `PATH`, supporting HEVC in NUT and MP4 stream copy. This command is required only when export is requested. |
 | `export_weights`, `calibrate` | The `export` extra. Export restores weights on the CPU; calibration also requires the GPU evaluation conditions above. |
 
 The library checks missing CUDA support and video codec capabilities before the
@@ -46,6 +47,8 @@ User-supplied `imports` modules must follow the same rule to preserve this prope
 Video pixels stay on the GPU for conversion, resizing and temporal compression.
 Compressed packets and bitstreams pass through host memory. An `ffmpeg` encoder
 command is not part of the training path.
+The run's `environment.json` records both `pixtreme-transport-nvenc` and
+`pixtreme-transport-nvdec` package versions alongside pixtreme and torch.
 
 ## Train an image model
 
@@ -364,6 +367,38 @@ LQ stream (B=`0`, P=`1`, I=`2`). The evaluation step selects model resets and
 metric aggregation. An empty selected range is diagnosed before evaluation.
 The existing source format, GPU and codec capability requirements also apply
 to this data type.
+
+To save the compressed LQ used by one evaluation stream, pass an MP4 destination
+to the same context:
+
+```python
+with dataset.stream(material, lq_path="evaluation/lq.mp4") as samples:
+    for sample in samples:
+        prediction = evaluate_video_frames(sample)
+```
+
+`lq_path` defaults to `None`. Export requires `temporal_compression`; it copies
+the same HEVC access units sent to the evaluation decoder, without another
+encode or any change to samples or metrics. Codec selection and chosen settings
+remain in `temporal_compression` and `sample["compression"]`. This also supports
+B frames and the RGB and YCbCr LQ paths.
+
+The MP4's presentation time for display frame `i` is `i / R`, starting at zero,
+where `R` is the chosen `sample["compression"]["frame_rate"]` rational. The
+source's original `pts`, `time_base` and `times` remain in the samples. A frame
+rate override, source time range or stride can therefore make the MP4's times
+differ from the source's absolute times. FFmpeg supplies decoding timestamps
+from the access units' presentation positions and observed reordering depth.
+
+Export stages compressed bytes and container metadata on disk beside the
+destination; decoded pictures remain on the GPU. Allow disk space for the
+temporary compressed input and MP4. The destination's parent directories are
+created when needed. After the iterator is exhausted and the context exits
+successfully, ffmpeg performs stream copy and the completed MP4 atomically
+replaces the destination. A `break`, unconsumed iterator or evaluation exception
+discards the temporary export and preserves any previous destination. A mux or
+file error also preserves the previous destination and raises an exception.
+Use a separate destination for each material whose LQ you want to retain.
 
 | Video data key | Default/meaning |
 | --- | --- |
@@ -698,9 +733,9 @@ The registered step's `check_checkpoint` validates model records first; rejected
 records never become an inference network or a published weight artifact.
 
 `export_weights(checkpoint, output, *, name="main", ema=True, metadata,
-transform=None)` writes a new artifact directory containing `weights.safetensors`
+transform=None, inference_metadata=None)` writes a new artifact directory containing `weights.safetensors`
 and `manifest.json`, with source checkpoint SHA256, selected network/weights and
-completed update count. `metadata` must declare positive integer `scale`,
+completed update count. The manifest's `metadata` must declare positive integer `scale`,
 `input_color` and `output_color` (`colorspace` and `gamma`), `normalization`, and
 `value_clipping`. Optional `transform(state_dict)` converts tensor names/values
 before tensoracle writes safetensors. The artifact contains inference weights,
@@ -708,6 +743,52 @@ not optimizer, RNG or resumable training state.
 Export and calibration deserialize the source checkpoint once and share that
 validated content for weight selection and provenance. The SHA256 is computed
 from the same open source file before deserialization.
+
+Pass `inference_metadata` to put the trainer's string keys and string values
+directly into `weights.safetensors`'s `__metadata__` header. An inference consumer
+can then read these conventions from that file alone. This mapping is the source
+for the header and is not copied into `manifest.json`; the existing structured
+`metadata` argument continues to describe the manifest. The trainer chooses both
+declarations and keeps any shared conventions consistent. Export does not infer
+header fields from the checkpoint, convert values to strings, or compare header
+fields with the manifest or saved model records.
+
+For example, a trainer with cda-vsr-style inference conditions can declare its
+header's wire values explicitly:
+
+```python
+from pixtreme.train.common import export_weights
+from safetensors import safe_open
+
+export_weights(
+    checkpoint,
+    artifact_directory,
+    metadata={
+        "scale": 2,
+        "input_color": {"colorspace": "Rec.709", "gamma": "sRGB"},
+        "output_color": {"colorspace": "Rec.709", "gamma": "sRGB"},
+        "normalization": "float32 scene values",
+        "value_clipping": "codec_only",
+    },
+    inference_metadata={"residual_unit": "normalized_rgb", "scale": "2", "gate": "true"},
+)
+with safe_open(artifact_directory / "weights.safetensors", framework="pt") as weights:
+    inference_conditions = weights.metadata()
+```
+
+The trainer's step can save `residual_unit`, `scale`, and `gate` in its model
+record and validate that record in `check_checkpoint`. Export runs that check
+before applying weights or calling `transform`; an incompatible record prevents
+publication even when `inference_metadata` is valid. The trainer remains
+responsible for choosing header values that describe the checked model.
+
+Omitting `inference_metadata` or passing `None` preserves metadata-free weight
+bytes; `{}` writes an empty header mapping. Tensoracle validates this argument:
+non-string keys or values raise `TypeError`, and invalid UTF-8 or an oversized
+header raises `ValueError`. Empty strings, Unicode, whitespace and embedded NUL
+characters are preserved. Export propagates the converter's exception with
+`inference_metadata` key context in its exception notes and publishes no partial
+artifact.
 
 `calibrate(checkpoint, output, *, materials, preprocess, preprocessing, targets,
 infer_low_precision, metadata, ...)` also writes scales, provenance, and
