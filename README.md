@@ -304,10 +304,39 @@ perform source decoding and this input conversion for their callers.
 ## Video data and temporal compression
 
 Choose the registered data type `video` for training or `video_evaluation` for
-ordered evaluation. Supply `paths` containing video files or saved `VideoIndex`
-JSON files. These datasets produce TCHW float32 GPU clips. A model-specific
+ordered evaluation. Supply `paths` containing video files, saved `VideoIndex`
+JSON files, or directories. Each directory contributes recursively collected
+video files in path order, using `video_paths` below. This also applies to
+`video_stream_evaluation`. These datasets produce TCHW float32 GPU clips. A model-specific
 training/evaluation step must handle the temporal dimension and model state;
 the default image step does not adapt a video model automatically.
+
+`video_paths(directory, *, prefixes=())` returns a list of `Path` objects. It
+matches `.mp4`, `.m4v`, `.mov`, `.mkv`, `.webm`, `.avi`, `.ts`, `.m2ts`, `.mts`,
+and `.mxf` without regard to suffix case. It excludes files and directories
+whose names begin with `.` beneath the requested directory, and does not follow
+directory symlinks. Optional `prefixes` select filenames at every depth.
+An empty selection raises an error naming the directory and extension conditions
+before updates or evaluation. Collection only checks paths and suffixes; it
+requires no GPU, codec initialization or `ffprobe`. A collected file must still
+pass the existing indexing and decoder capability checks.
+
+```python
+from pixtreme.train.common import video_paths
+
+sources = video_paths("videos")  # Includes videos nested below this directory.
+selected = video_paths("videos", prefixes=("training_",))
+```
+
+Each directory expands at its position in `paths`. Directory contributions
+exclude files explicitly listed anywhere in `paths` and files already collected
+from another directory, comparing resolved paths. Explicit files keep their
+order and repetitions, including when they follow a directory. Explicit video
+and index JSON inputs retain their existing behavior and are not restricted by
+the directory suffix or hidden-entry rules. The resolved configuration records
+the expanded file list. Resolving the original directory configuration again
+discovers added files; resuming after additions, removals or source changes uses
+the same configuration and data-state correspondence checks as explicit files.
 
 For whole-video evaluation, choose `video_stream_evaluation`. The model's
 evaluation step opens each material with `with dataset.stream(material) as samples:`.
@@ -411,7 +440,7 @@ Use a separate destination for each material whose LQ you want to retain.
 | `colorspace`, `gamma` | `Rec.709`, `Rec.709`; RGB output color. Source color comes from video metadata. |
 | `temporal_compression` | `null`, or a HEVC settings mapping as below. |
 | `lq_resize` | `rgb`; `ycbcr` selects source YCbCr reduction before encoder conversion and requires `temporal_compression`. Applies to training and evaluation. |
-| `index_paths` | Optional mapping from entries in `paths` to index JSON destinations. Omit it to keep rebuilding video paths without saving indexes. Available for training and evaluation. |
+| `index_paths` | Optional mapping from expanded video file paths to index JSON destinations. Keys name individual videos, including directory-collected videos, using the spelling returned by `video_paths`; directory and saved-index JSON keys are rejected. Omit it to keep rebuilding video paths without saving indexes. Available for training and evaluation. |
 | `patch_size` | Training only: `null` (return the entire prepared clip), or final GT patch size divisible by `scale`. Patches are cut after temporal compression. When set, it must fit `crop_size` and every source. |
 | `patches_per_clip` | Training only: `1`; positive integer number of consecutive samples from each decoded/compressed clip. Values above `1` require `patch_size`. Independent of `train.batch_size`; a clip's samples may span batches. |
 
@@ -421,6 +450,12 @@ filename. Destination directories must already exist. For a source named
 `training.mov`, set `index_paths: {training.mov: .training.mov.index.json}` in
 its data entry, as in the training example below. Sources omitted from the
 mapping are scanned without saving an index.
+
+For `paths: [videos]`, a collected source `videos/training.mov` can use
+`index_paths: {videos/training.mov: indexes/training.json}`. A directory itself
+cannot be a mapping key. Use the public `video_paths("videos")` to enumerate
+sources when choosing destinations programmatically. Existing unknown-key and
+saved-index JSON validation also applies to directory inputs.
 
 Only new videos and videos with missing, unreadable, unsupported or mismatched
 indexes are scanned with `ffprobe`. Correspondence uses the resolved source
@@ -840,6 +875,7 @@ The following helpers are also public for custom training steps:
 | `rng_state(*, device=None, generators=None)` / `restore_rng_state(state, *, device=None, generators=None)` | Capture/restore Python, NumPy, torch CPU, optional CUDA and named torch generators; restoration validates all streams first. |
 | `NumberedSampler(size, generator, *, start=0)` | Yields `(global_sample_number, random_material_index)` with replacement. `sample_generator(seed, number)` supplies that sample's NumPy generator. `EndlessSampler(size, generator)` draws uniform material indices with replacement from the supplied torch generator. |
 | `image_paths(directory, *, prefixes=())` | Lists supported direct child images in filename order, rejecting an empty selection. `augment_images(images, *, hflip, vflip, transpose)` applies matching spatial transforms to a mapping of tensors. |
+| `video_paths(directory, *, prefixes=())` | Recursively lists supported visible video files in path order, rejecting an empty selection. Prefixes select filenames at every depth. Directory inputs to video datasets use this collector; explicit files retain their order and repetitions. |
 | `warmup_cosine_factor(completed, *, warmup, total, minimum)` | Returns the learning rate coefficient for `completed` updates. Set `warmup=0` for cosine decay from `1.0` at zero updates to `minimum` at `total`; positive warmup lengths first increase the coefficient linearly. Requires `0 <= warmup < total` and `0 <= minimum <= 1`. |
 | `update_ema(average, model, *, decay)` | Averages floating state and copies nonfloating state. `check_finite_loss(loss, *, iteration)` and `check_finite_gradients(parameters)` reject nonfinite values; finite gradients are not clipped. |
 | `release_gpu_memory(device)` | Returns unused torch and CuPy allocator blocks for a CUDA device. |
