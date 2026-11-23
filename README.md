@@ -148,6 +148,7 @@ continues from the saved count when resuming a checkpoint.
 | `batch_size` | Positive integer, default `1`. |
 | `prefetch_batches` | Nonnegative integer, default `0`; bounds queued and in-progress batches together, including batches whose sample reads are pending. Zero creates only the batch being requested. Grouped video reads may also retain the unused tail of one clip, as described below. |
 | `sample_threads` | Positive integer, default `1`; builds samples in threads in the training process, preserving sampler order. With prefetch, reads from different batches share the same pool within the prefetch bound for datasets without `state_dict` and for standard video identity state. Custom mutable state keeps reads parallel within each batch. |
+| `supply_timeout` | Finite seconds greater than zero, integer or float, default `600`. Bounds the wait for the next training batch or evaluation data element, and the time allowed to save after a supply timeout. Always enabled; `null`, zero and negative values are rejected. |
 | `evaluation_interval` | Required and positive when `data.evaluation` is nonempty. |
 
 `register(kind, name)(component)` and `lookup(kind, name)` support `network`,
@@ -198,7 +199,10 @@ Accepting only `**kwargs` does not opt in, and uninspectable callables retain th
 two-argument call. Dataset factories and data types without a batch sampler
 keep their existing inputs and behavior.
 
-A custom dataset used with `sample_threads > 1` must support concurrent
+Data acquisition runs in the training process but outside the learning thread,
+including with `sample_threads: 1` and `prefetch_batches: 0`. Initialize any
+thread-local decoder state in the thread that performs the read. A custom
+dataset used with `sample_threads > 1` must support concurrent
 `__getitem__` calls, protect shared mutable state and derive random choices from
 the seed and sample number. Its checkpoint state must be independent of sample
 completion order. Datasets supplying `batch_sampler` continue to return complete
@@ -209,6 +213,147 @@ batches sequentially. Cross-batch reads are enabled only when the dataset has no
 state excludes unused future samples. A sample failure retains its exception
 type and adds the batch and sample numbers through the exception's `__notes__`;
 the CLI prints those notes.
+
+### Describe components and configuration keys
+
+Inspect registered components without starting training, allocating GPU resources,
+opening material files, or executing codecs:
+
+```bash
+pixtreme-train describe --import my_trainer > components.json
+```
+
+Repeat `--import MODULE` to load several registration modules. Python callers
+use the same operation. The command sends module-import messages to standard
+error so standard output contains just the JSON document:
+
+```python
+from pixtreme.train.common import describe_components
+
+metadata = describe_components(imports=["my_trainer"])
+network = metadata["components"]["network"]["my_network"]
+fields = network["schema"]["properties"]
+```
+
+Use the registered name from your trainer in place of `my_network`. Reading the
+descriptions imports the framework's built-in components and the explicitly
+requested modules, including their dependencies such as torch. It does not
+discover or import other training repositories. Registrations already loaded in
+the Python process also appear. A registration module and its schema provider
+must themselves avoid starting training or allocating GPU resources at import
+or description time.
+
+The result contains these JSON-compatible entries:
+
+| Entry | Contents |
+| --- | --- |
+| `imports` | Explicit module names passed to this call. Include these modules in the YAML's `imports` so another process can resolve the same names. |
+| `components.<kind>.<name>` | `description`, `source` (`declaration` or `signature`), `schema`, `injected`, and `unknown`. Kinds are the same seven kinds accepted by `register`. |
+| `configuration` | JSON Schema describing the common YAML envelope, defaults, training options, and references between named components. |
+| `degradation_pipeline` | JSON Schema for the ordered GT/LQ pipeline, from the same declaration used by its validator. |
+| `temporal_compression` | JSON Schema for temporal compression, from the same declaration used by its validator. |
+
+`configuration` marks component selections with `x-component-kind`. For example,
+`networks.additionalProperties` selects a `network`, and `data.train` selects a
+`dataset`. Choose its registered `type`, then use that component's `schema` for
+the remaining entry. JSON Schema `$ref` values are local to each returned
+schema; retain its `$defs` when rendering nested fields. Degradation operation
+schemas describe the parameters under the operation name, for example
+`{gaussian_blur: {sigma: 1.0}}`, rather than a `type` entry.
+
+Loss entries include `weight` (default `1.0`), which the step uses outside the
+loss factory. Optimizer entries include a required `networks` list referring to
+configured network names. Scheduler entries use their optimizer's name as the
+mapping key. `injected` names the arguments supplied by the framework, such as
+optimizer parameters, the scheduler's optimizer and total update count,
+dataset seed and device, and the step's networks, losses and common settings.
+These arguments are excluded from the component's user-input schema.
+
+Without an explicit declaration, the operation reads the factory's signature
+(names, type annotations and defaults) and its Google, NumPy or reST argument
+docstrings. Missing information remains explicit: `unknown.keys` is true when
+the accepted keys cannot be enumerated, and `unknown.fields` maps field names to
+missing `type`, `description`, or JSON-serializable `default` information.
+Opaque `**kwargs` factories and custom degradation operations remain available;
+`additionalProperties: true` permits their keys to be entered manually. A missing
+description or type does not hide a component or require its author to add a
+declaration.
+
+A registered class, factory, or degradation operation can optionally expose
+`config_schema()` with no arguments, returning an object JSON Schema for its
+accepted YAML mapping. This declaration takes precedence over signature and
+docstring extraction. It describes component options; the framework supplies
+the selection and composition keys (`type`, loss `weight`, optimizer
+`networks`). Built-in datasets and degradation operations return the same
+declarations used for validation. Custom datasets should likewise return a
+schema from the declaration used by their `resolve_config` method. The method
+is optional and does not change registration or training for existing parts.
+
+Descriptions guide configuration entry; they do not replace `resolve_config`
+or component-specific checks. Conditions between fields may require additional
+validation. In particular, leave `train.seed` absent to choose it once at run
+start or reuse the checkpoint's seed on resume. There is no configuration
+default for that key, and explicit `null` is invalid.
+
+### Build configuration in a browser
+
+Install the optional WebUI dependencies and start the local configuration builder:
+
+```console
+pip install 'pixtreme-train[webui]'
+pixtreme-train webui --import my_trainer
+```
+
+Open `http://127.0.0.1:7860`. Repeat `--import MODULE` for additional registration
+modules; `--port PORT` selects another port between 1 and 65535. The server binds
+to `127.0.0.1`. It loads the selected modules at startup and includes the same
+module list in exported YAML. Restart with different `--import` arguments to
+change that list. Without the extra, the command explains how to install it;
+training and `describe` do not require these dependencies.
+
+Use **Add entry** to name networks, losses, and optimizers. Select their registered
+types, connect each optimizer's `networks` list to the network names, then choose
+`data.train` and enter the training progress settings. For the default step, name
+the single network `main`, add at least one loss, and use one optimizer. Enable an
+optional key with its **Include** checkbox; leaving it unchecked omits the key.
+The displayed defaults describe what resolution supplies when a key is omitted;
+the form does not insert component constructor defaults. Leave `train.seed`
+unchecked to preserve its omission rather than setting it to `null`.
+
+The form handles nested objects, named mappings, arrays and fixed-length tuples,
+enum and constant choices, `anyOf`/`oneOf` alternatives, and local JSON Pointer
+`$ref` references. Select the `choices` or `range` alternative to enter sampled
+values. For opaque component keys, use **Add entry** and enter the value as JSON.
+Fields with unknown types, external or cyclic references, `allOf`, conditionals,
+or pattern-based objects use a JSON value editor. External references are not
+fetched. **Edit configuration as JSON** can replace the whole form for more
+complex inputs. The form guides entry; the server remains responsible for
+constraints and checks between fields.
+
+Click **Validate** to check the configuration, or **Export YAML** to check it and
+show the resulting YAML with resolved defaults. The **Download config.yaml** link
+saves that YAML. Both operations use `resolve_config`, report its key locations
+and reasons on failure, and preserve fields that resolution leaves absent. Save
+the YAML and pass it to `pixtreme-train train config.yaml --output runs/first`.
+The builder does not start training. Its HTML, CSS, and JavaScript ship in the
+wheel and load without an external CDN, font, or script.
+
+Python callers with the extra installed can use
+`pixtreme.train.common.webui.create_app(imports=["my_trainer"])`. Its HTTP endpoints
+are:
+
+| Endpoint | Input and response |
+| --- | --- |
+| `GET /api/components` | No input. Returns the same JSON document as `describe_components`, including startup `imports`, component schemas, and the common configuration schema. |
+| `POST /api/validate` | The configuration object as a JSON request body. Returns `{"config": <resolved configuration>}`. |
+| `POST /api/yaml` | The same JSON body. Returns the resolved configuration as `application/yaml`, with attachment filename `config.yaml`. |
+
+Both POST endpoints insert the startup `imports` when omitted. If an `imports`
+key is supplied, it must exactly match the startup list. HTTP requests never load
+other modules. Configuration errors return status 422 and
+`{"detail": "<resolver error, including its key location>"}`. JSON syntax errors
+use FastAPI's normal 422 response. These operations import component dependencies
+but do not initialize training, allocate GPU resources, or execute codecs.
 
 ### Image data and degradation
 
@@ -440,9 +585,21 @@ Use a separate destination for each material whose LQ you want to retain.
 | `colorspace`, `gamma` | `Rec.709`, `Rec.709`; RGB output color. Source color comes from video metadata. |
 | `temporal_compression` | `null`, or a HEVC settings mapping as below. |
 | `lq_resize` | `rgb`; `ycbcr` selects source YCbCr reduction before encoder conversion and requires `temporal_compression`. Applies to training and evaluation. |
+| `decode_retries` | `2`; nonnegative integer number of extra attempts after a source or LQ decoding failure, excluding the first attempt. `0` disables retries. Applies to all video data types. |
 | `index_paths` | Optional mapping from expanded video file paths to index JSON destinations. Keys name individual videos, including directory-collected videos, using the spelling returned by `video_paths`; directory and saved-index JSON keys are rejected. Omit it to keep rebuilding video paths without saving indexes. Available for training and evaluation. |
 | `patch_size` | Training only: `null` (return the entire prepared clip), or final GT patch size divisible by `scale`. Patches are cut after temporal compression. When set, it must fit `crop_size` and every source. |
 | `patches_per_clip` | Training only: `1`; positive integer number of consecutive samples from each decoded/compressed clip. Values above `1` require `patch_size`. Independent of `train.batch_size`; a clip's samples may span batches. |
+
+Each decode retry discards incomplete output and uses a fresh decoder with the
+same material, time interval and encoded input. Warnings identify the material,
+time interval, retry number and cause; exhaustion returns the material and cause
+to the caller. Sample selection, crops, compression choices and augmentation do
+not change. Configuration, source I/O and encoding failures are not retried.
+Whole-video evaluation keeps samples already delivered, discards unfinished
+deliveries and skips the delivered prefix when decoding again. Compressed LQ
+access units are staged in a temporary file and replayed without encoding again;
+the file is closed on completion, failure or early exit. A decode call that never
+returns is handled by the training supply time limit, separately from retries.
 
 To reuse indexes across starts, choose a destination for each video. The names
 and directories belong to the caller; the foundation does not impose a cache
@@ -886,10 +1043,11 @@ pixtreme-train train config.yaml --output runs/continued --resume runs/first/che
 ```
 
 Resume permits changes to `train.iterations` (must exceed completed updates),
-`train.device`, `train.sample_threads`, `train.channels_last`,
+`train.device`, `train.sample_threads`, `train.supply_timeout`, `train.channels_last`,
 `train.cudnn_benchmark`, `train.compile`, and `notes`. Other settings must match the
 saved configuration, including data sources, degradation, color, batch size and
-prefetch depth. Version 2 checkpoints lacking `sample_threads` use `1`; missing
+prefetch depth. Version 2 checkpoints lacking `supply_timeout` use `600` seconds;
+those lacking `sample_threads` use `1`; missing
 network execution options mean `channels_last: false`, `cudnn_benchmark: false`,
 and `compile: null`. These options may change on resume in either direction
 without converting checkpoint weights. Model
@@ -908,6 +1066,7 @@ conditions and a tolerance suitable for the operation.
 The first SIGINT/SIGTERM stops new batch production, finishes an in-progress
 update, and saves the last completed state. No checkpoint is written before the
 first completed update or when no update has advanced since the last checkpoint.
+
 An interrupted evaluation does not become a successful report. A second signal
 exits without waiting for saving. The first signal also consolidates
 `training.jsonl` in the same format as normal completion, containing only
@@ -915,6 +1074,38 @@ completed updates and completed evaluations. Before the first completed update,
 the file is empty. Incomplete updates are excluded, and an interrupted
 evaluation contributes no evaluation values or report. A second signal skips
 this consolidation when it has not started and can interrupt it in progress.
+
+If training batch supply or evaluation data supply does not return within
+`train.supply_timeout` seconds, the command stops learning and exits with code
+`75` (temporary failure; restart may succeed). The wait starts when the learner
+requests the next batch, even when prefetch is disabled. Evaluation bounds each
+indexed read, iteration and entry/exit/iteration of a dataset's `stream()` context;
+other custom dataset methods and evaluation calculations are outside this limit.
+Evaluation calculations and hooks stay on the learning thread; data acquisition
+inherits the caller's CUDA stream and gradient/autocast settings.
+
+The command writes the normal `training.jsonl` containing completed updates,
+discards partial evaluation metrics, and saves the last completed update unless
+it was already saved. Before update one, it writes no checkpoint. Saving after
+a supply timeout has the same time limit; if saving also stalls, the command
+exits without publishing an incomplete checkpoint. It reports the dataset,
+reason, saved checkpoint (or that none was saved), and how to continue on stderr.
+The command flushes its output and completed records and exits without waiting
+for unfinished native calls. Continue with a new output directory, for example:
+
+```console
+pixtreme-train train config.yaml --output runs/retry --resume runs/first/checkpoint_00000500.pt
+```
+
+If no checkpoint was saved, retry from an earlier checkpoint, or restart the run.
+
+Python callers of `train()` receive `SupplyTimeoutError`, a `RuntimeError`
+exported from `pixtreme.train.common`. Its `target` names the batch or evaluation
+dataset, `reason` describes the expired wait, and `checkpoint` is a `Path` to the
+saved or reused checkpoint, or `None` when none is available. After catching this
+exception, end the process and start a new process using `--resume`; do not
+continue training in that process, because the CUDA state may be unusable.
+Unfinished supply threads do not prevent the caller's process from exiting.
 
 ### Migration from 0.3.x
 
