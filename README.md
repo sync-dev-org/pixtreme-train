@@ -33,7 +33,7 @@ The `export` extra adds `tensoracle[convert]>=2.6.1`.
 | Read/write YAML, `Option`, `plain`, `resolve_config` | PyYAML; resolving a data type or an `imports` module also loads that component's Python dependencies. Built-in image data resolution loads torch and pixtreme for types and color validation, without CUDA initialization or allocation. |
 | Image preprocessing, standard training and evaluation, PSNR/SSIM/VMAF | NVIDIA GPU, compatible driver and CUDA-enabled pixtreme/torch. Current pixtreme wheels require CUDA 13.x, driver R580 or later, and compute capability 7.5 or later. The selected torch wheel and its CUDA runtime must also match the driver. |
 | Video indexing and packet demux | The `ffprobe` command on `PATH`, with support for the source container and codec. |
-| Video source decoding | `pixtreme-transport-nvdec` and a GPU/driver supporting the actual codec, chroma layout, bit depth and dimensions. Unsupported sources are rejected; source decoding has no CPU fallback. |
+| Video source decoding | `pixtreme-transport-nvdec` for codec/format combinations supported by the selected GPU; otherwise `pixtreme-transport-ffmpeg` for software decoding and upload to GPU PixelBuffers. Both paths require a compatible NVIDIA GPU/driver for subsequent pixel processing. Inputs unsupported by both decoders are rejected before training or evaluation. |
 | `temporal_compression`, `encode_hevc` | `pixtreme-transport-nvenc`, HEVC NVENC support (NVENC API 13.0, driver R580 or later), and NVDEC support for the selected encoded format. Source and compressed LQ decoding use the same process. |
 | Compressed evaluation LQ export (`stream(..., lq_path=...)`) | The `ffmpeg` command on `PATH`, supporting HEVC in NUT and MP4 stream copy. This command is required only when export is requested. |
 | `export_weights`, `calibrate` | The `export` extra. Export restores weights on the CPU; calibration also requires the GPU evaluation conditions above. |
@@ -528,8 +528,9 @@ unwinds that method on a training signal. Use each context and its iterator on
 the same thread. Exiting the context, even after `break` or an exception,
 releases its source, encoder and LQ decoder without reading the remainder.
 GPU retention covers delivery buffers and codec delay; the source is decoded
-as the consumer advances. Only compressed bytes and timing/container metadata
-pass through the CPU. Delivered tensors remain valid after context exit.
+as the consumer advances. Indexing, demux and compressed bytes pass through the
+CPU; sources unsupported by NVDEC also use CPU software decoding and upload
+each picture before GPU pixel processing. Delivered tensors remain valid after context exit.
 Callers retain those tensors for as long as they need them.
 
 Stream samples carry the same fields, color, exact `pts`/`time_base`, source
@@ -806,12 +807,33 @@ Direct Python operations include `VideoIndex.build(source, *, cache_path=None)`,
 `ClipSampler`/`ClipSelection`, `VideoField`/`VideoSample`,
 `VideoClipReader.read/close`, and
 `VideoDataset`/`VideoEvaluationDataset`/`VideoStreamEvaluationDataset`.
+Source decoding is selected per material before the first sample is requested.
+Supported codec, chroma layout, bit depth and dimensions use NVDEC on the selected
+GPU. Other inputs, including ProRes, use the public
+[`pixtreme.transport.ffmpeg` Reader](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg).
+It decodes on the CPU and completes the upload into independently owned GPU
+PixelBuffers before the usual RGB conversion, crop, resize and compression.
+Display order, exact source PTS/time_base, effective bit depth and color
+declarations are preserved. Index persistence, clip selection and resume checks
+work identically for both paths. Temporal compression still encodes with NVENC
+and decodes LQ with NVDEC, including when the source uses software decoding.
+
+The `pixtreme.train.common.video` logger emits an `INFO` record per material
+with its path, selected decoder (`nvdec` or `ffmpeg`) and CPU stages. Enable
+that logger to inspect the selection. Unsupported software formats, such as
+planar 4:1:1, are diagnosed with the material path and FFmpeg's reason before
+updates or evaluation. An NVDEC capability-query error or a failure while
+NVDEC is running remains an error; neither switches that material to software.
+Software decode errors use the same `decode_retries` limit as other source
+decode errors, without changing sample selection. Source software decoding uses
+the bundled FFmpeg libraries through Python, without an `ffmpeg` child process.
+
 `VideoClipReader.read_pictures(selection)` returns source PixelBuffers in the
 selection's display order, preserving their format, declarations and code bits.
 The selection retains exact PTS/time_base correspondence. Each picture owns a
 GPU copy, so it remains usable after another read or `close()`; callers release
-the returned pictures when finished. The method uses the same bounded source
-decoder sessions as `read`.
+the returned pictures when finished. Both methods retain bounded per-thread
+NVDEC sessions; software readers are closed after each clip or stream context.
 `TemporalCompression.resolve_config` validates settings without running codecs;
 `select(generator)` returns scalar settings, `validate(...)` checks capabilities,
 and `apply(lq, generator, *, frame_rate, ...)` returns fields and chosen settings.
