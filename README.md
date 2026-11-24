@@ -828,7 +828,7 @@ Software decode errors use the same `decode_retries` limit as other source
 decode errors, without changing sample selection. Source software decoding uses
 the bundled FFmpeg libraries through Python, without an `ffmpeg` child process.
 
-`VideoClipReader.read_pictures(selection)` returns source PixelBuffers in the
+`VideoClipReader.read_pictures(selection, *, decode_retries=0)` returns source PixelBuffers in the
 selection's display order, preserving their format, declarations and code bits.
 The selection retains exact PTS/time_base correspondence. Each picture owns a
 GPU copy, so it remains usable after another read or `close()`; callers release
@@ -837,6 +837,31 @@ NVDEC sessions; software readers are closed after each clip or stream context.
 `TemporalCompression.resolve_config` validates settings without running codecs;
 `select(generator)` returns scalar settings, `validate(...)` checks capabilities,
 and `apply(lq, generator, *, frame_rate, ...)` returns fields and chosen settings.
+
+Both `read_pictures` and `TemporalCompression.apply` accept `decode_retries=0`,
+a nonnegative integer number of extra attempts after a decoding failure. The
+default makes one attempt; passing `2` allows at most three attempts in total.
+This differs from the video data types' configured default of two extra attempts.
+Retries discard partial pictures or LQ fields and decode the same selection or
+encoded bytes, keeping compression choices and the generator's subsequent state
+unchanged. Source I/O, configuration and encoding errors are not retried.
+
+Each retry emits a Python logging warning with the target, retry number/limit
+and cause, for example:
+
+```text
+source /data/clip.mov time [1/3, 3/2]s: decode retry 1/2: <decoder reason>
+```
+
+`read_pictures` obtains the target from the selection's source paths and minimum
+and maximum selected times for each path. `video_decode_target(selection)`,
+exported from `pixtreme.train.common`, returns that same description without the
+`source` prefix, retaining exact rational seconds and material order. For LQ,
+pass `decode_target=f"LQ {video_decode_target(selection)}"` to `apply`; its default
+target is `"LQ HEVC clip"`. After exhaustion, the source `ValueError` or LQ
+`RuntimeError` includes the target and decoder reason, including when retries
+are disabled. The private `apply` arguments `_decode_retries` and `_decode_target`
+have been replaced by these public names.
 
 `TemporalCompression.close()` releases every LQ decoder session retained by
 `apply`, including sessions opened by other sample threads. It is safe before
@@ -872,10 +897,13 @@ accepts these pictures with `scale` and `crops`, returning decoded RGB fields
 and selected settings through the same LQ decoder sessions. For example:
 
 ```python
-pictures = reader.read_pictures(selection)
+from pixtreme.train.common import video_decode_target
+
+pictures = reader.read_pictures(selection, decode_retries=2)
 fields, chosen = compression.apply(
     pictures, generator, frame_rate=frame_rate, scale=2,
     colorspace="Rec.709", gamma="Rec.709",
+    decode_retries=2, decode_target=f"LQ {video_decode_target(selection)}",
 )
 ```
 
