@@ -163,6 +163,16 @@ Network classes and steps can implement `check_config`; steps can implement
   here and initialize any EMA or model-specific averaged weights together. Load
   tensors into the existing network objects so optimizer parameters stay attached.
   Resume calls `load_state_dict` instead and never calls `initialize`.
+- `check_resume_file(cls, path: Path) -> None` is a classmethod called only on
+  resume, after resolving the configuration and selecting its step, before
+  reading or validating the common checkpoint format and before creating the
+  output directory. It receives only the checkpoint's `Path`; the trainer
+  chooses how to read it. Raise `ValueError` to explain an unsupported model
+  format and how to continue. `train()` propagates that error unchanged; the
+  training command writes it to standard error and exits with code `2`.
+  Returning normally continues the common format checks. Steps inheriting the
+  default no-op retain those checks. Fresh training and network extraction do
+  not call this method.
 - `check_checkpoint(cls, saved)` is a classmethod receiving the complete,
   format-checked checkpoint, including `saved["config"]` and `saved["step"]`.
   Validate model-specific records here and raise `ValueError` identifying the
