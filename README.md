@@ -25,7 +25,7 @@ For a uv project, use `uv add pixtreme-train` or
 
 The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 `docstring-parser>=0.16`, NumPy, `Pillow>=11`, `pixtreme>=2.28.0`,
-`pixtreme-transport-ffmpeg>=0.2.0`, `pixtreme-transport-nvdec>=0.12.0`,
+`pixtreme-transport-ffmpeg>=0.6.0`, `pixtreme-transport-nvdec>=0.12.0`,
 `pixtreme-transport-nvenc>=0.12.0`, `pydantic>=2.9`, `PyYAML>=6`, and
 `torch>=2.11`. The `export` extra adds `tensoracle[convert]>=2.7.0`, and the
 `webui` extra adds `fastapi>=0.115` and `uvicorn>=0.30`.
@@ -34,7 +34,7 @@ The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 | --- | --- |
 | Read/write YAML, `Option`, `plain`, `resolve_config` | PyYAML; resolving a data type or an `imports` module also loads that component's Python dependencies. Built-in image data resolution loads torch and pixtreme for types and color validation, without CUDA initialization or allocation. |
 | Image preprocessing, standard training and evaluation, PSNR/SSIM/VMAF | NVIDIA GPU, compatible driver and CUDA-enabled pixtreme/torch. Current pixtreme wheels require CUDA 13.x, driver R580 or later, and compute capability 7.5 or later. The selected torch wheel and its CUDA runtime must also match the driver. |
-| Video indexing and packet demux | The `ffprobe` command on `PATH`, with support for the source container and codec. |
+| Video indexing and clip packet demux | `pixtreme-transport-ffmpeg>=0.6.0`, using its Python `Demuxer` and CPU `VideoDecoder.receive_info()` APIs. Indexing requires no GPU, and neither operation starts an external command. |
 | Video source decoding | `pixtreme-transport-nvdec` for codec/format combinations supported by the selected GPU; otherwise `pixtreme-transport-ffmpeg` for software decoding and upload to GPU PixelBuffers. Both paths require a compatible NVIDIA GPU/driver for subsequent pixel processing. Inputs unsupported by both decoders are rejected before training or evaluation. |
 | `temporal_compression`, `encode_hevc` | `pixtreme-transport-nvenc`, HEVC NVENC support (NVENC API 13.0, driver R580 or later), and NVDEC support for the selected encoded format. Source and compressed LQ decoding use the same process. |
 | Compressed evaluation LQ export (`stream(..., lq_path=...)`) | The `ffmpeg` command on `PATH`, supporting HEVC in NUT and MP4 stream copy. This command is required only when export is requested. |
@@ -628,7 +628,7 @@ sources when choosing destinations programmatically. Existing unknown-key and
 saved-index JSON validation also applies to directory inputs.
 
 Only new videos and videos with missing, unreadable, unsupported or mismatched
-indexes are scanned with `ffprobe`. Correspondence uses the resolved source
+indexes are inspected on the CPU with pixtreme-transport-ffmpeg. Correspondence uses the resolved source
 path, byte size, and modification time floored to whole seconds. Differences
 within the same second also remain accepted by subsequent reads and resume.
 Changing the path, size, whole-second modification time or indexed frame timing
@@ -643,18 +643,43 @@ Direct callers use the same behavior through
 always scans and does not save. `VideoIndex.save(destination)` also uses complete
 file replacement, but reports save errors to its caller. `VideoIndex.load(path)`
 loads a saved index without scanning and reports errors rather than rebuilding.
-Existing version 2 JSON indexes remain readable. Version 1 indexes lack
+New JSON indexes use version 3. Packets have explicit zero-based decode-order
+`packet_index` values; display frames refer to those values. They contain
+transport timestamps (unknown packet PTS, DTS or duration remains unknown), codec
+configuration, dimensions, pixel format and container colour declarations.
+Packets and configuration retain their native framing. Length-prefixed
+H.264/HEVC payloads are converted to Annex B only when submitted to NVDEC.
+No file offsets or container format names are stored. Python `VideoFrame.position`
+is the decode-order packet number for v3; for a loaded v2 index it retains its
+original file-offset meaning. All clip payloads, including v2 inputs, are read
+with `Demuxer`. A seek is checked against the indexed decode-order packet prefix;
+if the demuxer skipped that prefix, reading from the beginning recovers it.
+Only the required prefix is submitted; draining supplies delayed pictures
+without decoding future packets outside that range.
+
+Existing version 2 JSON indexes remain readable and reusable, and saving them
+preserves version 2 and both original fingerprints. Version 1 indexes lack
 container color metadata and require rebuilding: pass the original video and
 destination to `build`, or use video paths with `index_paths`. Passing an old
-JSON file directly in `paths` reports its unsupported format.
+JSON file directly in `paths` reports its unsupported format. CPU inspection
+checks every display picture's colour and interlace; HEVC checks its VUI and
+picture-timing declarations, distinguishing undeclared colour from decoder defaults.
+For containers without packet PTS, known DTS supplies display times only after
+CPU inspection proves that the entire picture sequence preserves decode order;
+the frame's `pts_source="dts"` records this interpretation, while packet PTS
+remains unknown. Reordered pictures or missing PTS and DTS are diagnosed.
 
-Video data state remains version 1. New fingerprints normalize the source
-modification time to whole seconds and retain the full indexed metadata and
-timing. Older exact-nanosecond fingerprints are accepted when their original
-version 2 index reproduces the saved fingerprint. Keep that index when resuming
-an older checkpoint; if it has been rebuilt with different fractional seconds
-and no longer matches, start a new run. No index or checkpoint is silently
-reinterpreted as a different material.
+Video data state remains version 1. Version 3 fingerprints are prefixed `v3:`
+and hash the index version, resolved source path/size/whole-second modification
+time, time base, stream codec/pixel format/dimensions/configuration, display frame
+numbers/PTS/timestamp sources/types/random-access flags/packet references, decode-order packet
+numbers/sizes/PTS/DTS/durations, and container colour. Original canonical and
+exact-nanosecond v2 fingerprints keep their existing calculation. Keep the
+original v2 caches to resume a checkpoint whose data state contains those
+fingerprints. If a v2 cache is missing or rebuilt as v3, resume rejects the
+fingerprint mismatch and explains how to restore the original v2 cache or
+resume with pixtreme-train 0.13.x. Start a new run to use the rebuilt v3 index.
+No index or checkpoint is silently reinterpreted as a different material.
 
 `crop_size` keeps its existing meaning: it selects the GT region before LQ
 reduction and temporal compression. `patch_size` selects a smaller region after
