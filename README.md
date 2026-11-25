@@ -23,10 +23,12 @@ pip install 'pixtreme-train[export]'
 For a uv project, use `uv add pixtreme-train` or
 `uv add 'pixtreme-train[export]'`.
 
-The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`, NumPy,
-`Pillow>=11`, `pixtreme>=2.24.0`, `pixtreme-transport-nvdec>=0.11.4`,
-`pixtreme-transport-nvenc>=0.11.0`, `PyYAML>=6`, and `torch>=2.11`.
-The `export` extra adds `tensoracle[convert]>=2.6.1`.
+The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
+`docstring-parser>=0.16`, NumPy, `Pillow>=11`, `pixtreme>=2.28.0`,
+`pixtreme-transport-ffmpeg>=0.2.0`, `pixtreme-transport-nvdec>=0.12.0`,
+`pixtreme-transport-nvenc>=0.12.0`, `pydantic>=2.9`, `PyYAML>=6`, and
+`torch>=2.11`. The `export` extra adds `tensoracle[convert]>=2.7.0`, and the
+`webui` extra adds `fastapi>=0.115` and `uvicorn>=0.30`.
 
 | Operation | Execution conditions |
 | --- | --- |
