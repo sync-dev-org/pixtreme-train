@@ -24,8 +24,8 @@ For a uv project, use `uv add pixtreme-train` or
 `uv add 'pixtreme-train[export]'`.
 
 The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
-`docstring-parser>=0.16`, NumPy, `Pillow>=11`, `pixtreme>=2.28.0`,
-`pixtreme-transport-ffmpeg>=0.6.0`, `pixtreme-transport-nvdec>=0.12.0`,
+`docstring-parser>=0.16`, NumPy, `Pillow>=11`, `pixtreme>=2.31.0`,
+`pixtreme-transport-ffmpeg>=0.7.0`, `pixtreme-transport-nvdec>=0.12.0`,
 `pixtreme-transport-nvenc>=0.12.0`, `pydantic>=2.9`, `PyYAML>=6`, and
 `torch>=2.11`. The `export` extra adds `tensoracle[convert]>=2.7.0`, and the
 `webui` extra adds `fastapi>=0.115` and `uvicorn>=0.30`.
@@ -34,7 +34,7 @@ The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 | --- | --- |
 | Read/write YAML, `Option`, `plain`, `resolve_config` | PyYAML; resolving a data type or an `imports` module also loads that component's Python dependencies. Built-in image data resolution loads torch and pixtreme for types and color validation, without CUDA initialization or allocation. |
 | Image preprocessing, standard training and evaluation, PSNR/SSIM/VMAF | NVIDIA GPU, compatible driver and CUDA-enabled pixtreme/torch. Current pixtreme wheels require CUDA 13.x, driver R580 or later, and compute capability 7.5 or later. The selected torch wheel and its CUDA runtime must also match the driver. |
-| Video indexing and clip packet demux | `pixtreme-transport-ffmpeg>=0.6.0`, using its Python `Demuxer` and CPU `VideoDecoder.receive_info()` APIs. Indexing requires no GPU, and neither operation starts an external command. |
+| Video indexing and clip packet demux | `pixtreme-transport-ffmpeg>=0.7.0`, using its Python `Demuxer` and CPU `VideoDecoder.receive_info()` APIs. Indexing requires no GPU, and neither operation starts an external command. |
 | Video source decoding | `pixtreme-transport-nvdec` for codec/format combinations supported by the selected GPU; otherwise `pixtreme-transport-ffmpeg` for software decoding and upload to GPU PixelBuffers. Both paths require a compatible NVIDIA GPU/driver for subsequent pixel processing. Inputs unsupported by both decoders are rejected before training or evaluation. |
 | `temporal_compression`, `encode_hevc` | `pixtreme-transport-nvenc`, HEVC NVENC support (NVENC API 13.0, driver R580 or later), and NVDEC support for the selected encoded format. Source and compressed LQ decoding use the same process. |
 | Compressed evaluation LQ export (`stream(..., lq_path=...)`) | The `ffmpeg` command on `PATH`, supporting HEVC in NUT and MP4 stream copy. This command is required only when export is requested. |
