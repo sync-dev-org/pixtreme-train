@@ -26,7 +26,8 @@ For a uv project, use `uv add pixtreme-train` or
 The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 `docstring-parser>=0.16`, NumPy, `Pillow>=11`, `pixtreme>=2.31.0`,
 `pixtreme-transport-ffmpeg>=0.7.0`, `pixtreme-transport-nvdec>=0.12.0`,
-`pixtreme-transport-nvenc>=0.12.0`, `pydantic>=2.9`, `PyYAML>=6`, and
+`pixtreme-transport-nvenc>=0.12.0`, `pixtreme-transport-video>=0.1.3`,
+`pydantic>=2.9`, `PyYAML>=6`, and
 `torch>=2.11`. The `export` extra adds `tensoracle[convert]>=2.7.0`, and the
 `webui` extra adds `fastapi>=0.115` and `uvicorn>=0.30`.
 
@@ -37,7 +38,7 @@ The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 | Video indexing and clip packet demux | `pixtreme-transport-ffmpeg>=0.7.0`, using its Python `Demuxer` and CPU `VideoDecoder.receive_info()` APIs. Indexing requires no GPU, and neither operation starts an external command. |
 | Video source decoding | `pixtreme-transport-nvdec` for codec/format combinations supported by the selected GPU; otherwise `pixtreme-transport-ffmpeg` for software decoding and upload to GPU PixelBuffers. Both paths require a compatible NVIDIA GPU/driver for subsequent pixel processing. Inputs unsupported by both decoders are rejected before training or evaluation. |
 | `temporal_compression`, `encode_hevc` | `pixtreme-transport-nvenc`, HEVC NVENC support (NVENC API 13.0, driver R580 or later), and NVDEC support for the selected encoded format. Source and compressed LQ decoding use the same process. |
-| Compressed evaluation LQ export (`stream(..., lq_path=...)`) | The `ffmpeg` command on `PATH`, supporting HEVC in NUT and MP4 stream copy. This command is required only when export is requested. |
+| Compressed evaluation LQ export (`stream(..., lq_path=...)`) | `pixtreme-transport-video>=0.1.3`, using its `PacketWriter` to write the NVENC access units to MP4 without re-encoding. No external command is started. |
 | `export_weights`, `calibrate` | The `export` extra. Export restores weights on the CPU; calibration also requires the GPU evaluation conditions above. |
 
 The library checks missing CUDA support and video codec capabilities before the
@@ -574,15 +575,17 @@ The MP4's presentation time for display frame `i` is `i / R`, starting at zero,
 where `R` is the chosen `sample["compression"]["frame_rate"]` rational. The
 source's original `pts`, `time_base` and `times` remain in the samples. A frame
 rate override, source time range or stride can therefore make the MP4's times
-differ from the source's absolute times. FFmpeg supplies decoding timestamps
-from the access units' presentation positions and observed reordering depth.
+differ from the source's absolute times. Decoding timestamps come from the
+NVENC access units in their coding order. The MP4 container also
+declares the colour that the encoder declared in the HEVC stream.
 
-Export stages compressed bytes and container metadata on disk beside the
-destination; decoded pictures remain on the GPU. Allow disk space for the
-temporary compressed input and MP4. The destination's parent directories are
+Export writes the MP4 to a temporary file beside the destination through
+`pixtreme-transport-video`'s `PacketWriter`; decoded pictures remain on the GPU.
+Allow disk space for the temporary MP4. The destination's parent directories are
 created when needed. After the iterator is exhausted and the context exits
-successfully, ffmpeg performs stream copy and the completed MP4 atomically
-replaces the destination. A `break`, unconsumed iterator or evaluation exception
+successfully, the completed MP4 atomically replaces the destination. A new
+destination gets the permissions of an ordinary file created by the process; a
+replaced destination keeps its permission bits. A `break`, unconsumed iterator or evaluation exception
 discards the temporary export and preserves any previous destination. A mux or
 file error also preserves the previous destination and raises an exception.
 Use a separate destination for each material whose LQ you want to retain.
