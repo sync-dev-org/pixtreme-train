@@ -26,7 +26,7 @@ For a uv project, use `uv add pixtreme-train` or
 The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 `docstring-parser>=0.16`, NumPy, `Pillow>=11`, `pixtreme>=2.31.0`,
 `pixtreme-transport-ffmpeg>=0.7.0`, `pixtreme-transport-nvdec>=0.12.0`,
-`pixtreme-transport-nvenc>=0.12.0`, `pixtreme-transport-video>=0.1.3`,
+`pixtreme-transport-nvenc>=0.12.0`, `pixtreme-transport-video>=0.1.4`,
 `pydantic>=2.9`, `PyYAML>=6`, and
 `torch>=2.11`. The `export` extra adds `tensoracle[convert]>=2.7.0`, and the
 `webui` extra adds `fastapi>=0.115` and `uvicorn>=0.30`.
@@ -37,6 +37,7 @@ The declared runtime dependencies are `cupy-cuda13x[ctk]>=14.1`,
 | Image preprocessing, standard training and evaluation, PSNR/SSIM/VMAF | NVIDIA GPU, compatible driver and CUDA-enabled pixtreme/torch. Current pixtreme wheels require CUDA 13.x, driver R580 or later, and compute capability 7.5 or later. The selected torch wheel and its CUDA runtime must also match the driver. |
 | Video indexing and clip packet demux | `pixtreme-transport-ffmpeg>=0.7.0`, using its Python `Demuxer` and CPU `VideoDecoder.receive_info()` APIs. Indexing requires no GPU, and neither operation starts an external command. |
 | Video source decoding | `pixtreme-transport-nvdec` for codec/format combinations supported by the selected GPU; otherwise `pixtreme-transport-ffmpeg` for software decoding and upload to GPU PixelBuffers. Both paths require a compatible NVIDIA GPU/driver for subsequent pixel processing. Inputs unsupported by both decoders are rejected before training or evaluation. |
+| Whole-video evaluation input (`VideoStreamEvaluationDataset.stream`) | `pixtreme-transport-video>=0.1.4`, using its `VideoEntrance` to decode each video from its first frame with the decoder selected for that material (NVDEC or FFmpeg). Colour attributes that the bitstream does not declare come from the container's colour declaration. No external command is started. |
 | `temporal_compression`, `encode_hevc` | `pixtreme-transport-nvenc`, HEVC NVENC support (NVENC API 13.0, driver R580 or later), and NVDEC support for the selected encoded format. Source and compressed LQ decoding use the same process. |
 | Compressed evaluation LQ export (`stream(..., lq_path=...)`) | `pixtreme-transport-video>=0.1.3`, using its `PacketWriter` to write the NVENC access units to MP4 without re-encoding. No external command is started. |
 | `export_weights`, `calibrate` | The `export` extra. Export restores weights on the CPU; calibration also requires the GPU evaluation conditions above. |
@@ -48,8 +49,7 @@ CUDA, allocate GPU memory, open source material, or start an encoder/decoder.
 User-supplied `imports` modules must follow the same rule to preserve this property.
 
 Video pixels stay on the GPU for conversion, resizing and temporal compression.
-Compressed packets and bitstreams pass through host memory. An `ffmpeg` encoder
-command is not part of the training path.
+Compressed packets and bitstreams pass through host memory.
 The run's `environment.json` records both `pixtreme-transport-nvenc` and
 `pixtreme-transport-nvdec` package versions alongside pixtreme and torch.
 
@@ -102,6 +102,7 @@ train:
   batch_size: 8
   prefetch_batches: 2
   sample_threads: 1
+  supply_processes: 1
 ```
 
 ```console
@@ -149,8 +150,9 @@ continues from the saved count when resuming a checkpoint.
 | `cudnn_benchmark` | Boolean, default `false`; enables cuDNN convolution algorithm benchmarking during training and restores the caller's flag on success or failure. When false, the caller's flag is left alone. |
 | `compile` | `null` by default, or a [torch.compile mode](https://docs.pytorch.org/docs/stable/generated/torch.compile.html): `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`. Compiles each registered network's forward; checkpoint, EMA and exported weight names stay unchanged. Initial compilation takes time and may use additional memory. |
 | `batch_size` | Positive integer, default `1`. |
-| `prefetch_batches` | Nonnegative integer, default `0`; bounds queued and in-progress batches together, including batches whose sample reads are pending. Zero creates only the batch being requested. Grouped video reads may also retain the unused tail of one clip, as described below. |
-| `sample_threads` | Positive integer, default `1`; builds samples in threads in the training process, preserving sampler order. With prefetch, reads from different batches share the same pool within the prefetch bound for datasets without `state_dict` and for standard video identity state. Custom mutable state keeps reads parallel within each batch. |
+| `prefetch_batches` | Nonnegative integer, default `0`; bounds queued, running and out-of-order batches together across all supply processes, including batches whose sample reads are pending. Zero creates only the batch being requested. Grouped video reads may also retain the unused tail of one clip, as described below. |
+| `sample_threads` | Positive integer, default `1`; builds samples in threads within a supply process, preserving sampler order. With prefetch, stateless data and standard video identity state can read across batches within the global bound. Mutable data finishes each batch before starting the next. Data-owned batch samplers remain sequential. |
+| `supply_processes` | Positive integer, default `1`. Distributes independent built-in `image_degradation` batches across this many processes. Custom data and video retain one process that owns their state, clip tails and sampler. This count may change on resume. |
 | `supply_timeout` | Finite seconds greater than zero, integer or float, default `600`. Bounds the wait for the next training batch or evaluation data element, and the time allowed to save after a supply timeout. Always enabled; `null`, zero and negative values are rejected. |
 | `evaluation_interval` | Required and positive when `data.evaluation` is nonempty. |
 
@@ -212,8 +214,124 @@ Accepting only `**kwargs` does not opt in, and uninspectable callables retain th
 two-argument call. Dataset factories and data types without a batch sampler
 keep their existing inputs and behavior.
 
-Data acquisition runs in the training process but outside the learning thread,
-including with `sample_threads: 1` and `prefetch_batches: 0`. Initialize any
+Training and in-training evaluation data are constructed and read in spawned
+processes, including with `sample_threads: 1` and `prefetch_batches: 0`.
+Suppliers perform the existing GPU preprocessing, copy completed tensors into
+reusable shared host buffers, and send those buffers with sample metadata and
+state snapshots. The learner copies GPU tensors through its own pinned memory
+and finishes H2D before updating the network. Returned pixels belong to the
+learner and remain valid after a supplier exits. Shared host and pinned buffer
+allocation is separate from admission: increasing `supply_processes` does not
+multiply `prefetch_batches`. Zero prefetch creates only the requested batch.
+
+**Measured image training throughput.** A benchmark compared two ways to
+supply training batches. One configuration ran GPU preprocessing and batch
+construction in the process training the network. The other ran that work in
+separate supply processes and delivered batches through shared host memory
+and pinned memory owned by the learner to the training GPU.
+
+The measurement on 2026-11-28 used SPANv2 with 128 feature channels and 8 blocks,
+x2, patch 192, batch 8 and bf16, with BHI LSDIR/DF2K 512x512 WebP images and
+GPU JPEG q50 4:2:0 simulation. The host used an RTX A6000, driver 616.92, WSL2,
+a Threadripper PRO 3995WX, CPU affinity 0-31, `OMP_NUM_THREADS=32`,
+torch 2.14.1+cu132 and pixtreme 2.32.0. `sample_threads: 2` and
+`prefetch_batches: 2` were held constant. All three execution options enabled
+means `channels_last: true`, `cudnn_benchmark: true` and `compile: default`;
+their disabled defaults are `false`, `false` and `null`.
+
+Each setting with separate supply processes was measured in three paired
+comparisons with runs that supplied batches in the training process. The
+comparison rows combine nine such runs per execution setting. Every run used
+50 warm-up updates followed by 250 timed updates. Updates/s shows the mean
+and observed range; batch wait, network update, startup and RSS sum are means
+across the listed number of runs.
+
+| Batch supply | Execution options | Runs | Updates/s, mean (range) | Batch wait (ms) | Network update (ms) | Startup (s) | RSS sum (GiB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| In the training process | Disabled (defaults) | 9 | 15.13 (14.64–15.54) | 1.20 | 63.48 | 26.7 | 2.37 |
+| Separate, `supply_processes: 1` | Disabled (defaults) | 3 | 17.58 (17.26–17.80) | 1.89 | 54.04 | 27.8 | 3.11 |
+| Separate, `supply_processes: 2` | Disabled (defaults) | 3 | 17.63 (17.53–17.71) | 1.83 | 53.81 | 53.0 | 4.46 |
+| Separate, `supply_processes: 3` | Disabled (defaults) | 3 | 17.53 (17.34–17.75) | 1.66 | 54.26 | 78.9 | 5.80 |
+| In the training process | All three enabled | 9 | 15.41 (14.94–15.72) | 5.74 | 57.73 | 33.1 | 2.76 |
+| Separate, `supply_processes: 1` | All three enabled | 3 | 18.34 (18.25–18.43) | 12.96 | 40.55 | 33.2 | 3.52 |
+| Separate, `supply_processes: 2` | All three enabled | 3 | 23.20 (23.03–23.46) | 1.63 | 40.39 | 58.8 | 4.87 |
+| Separate, `supply_processes: 3` | All three enabled | 3 | 23.29 (23.19–23.47) | 1.48 | 40.35 | 85.2 | 6.21 |
+
+`supply_processes: 1` is the default because adding suppliers with the default
+network execution settings gave no throughput gain within the measured
+variation. Each additional process added roughly 25 seconds to startup and
+about 1.4 GiB to the RSS sum. With all three execution options enabled, two
+suppliers increased throughput from about 18.3 to 23.2 updates/second. A third
+supplier gave no further gain within the measured variation.
+
+Updates/s covers the full training loop, batch wait measures time spent
+obtaining the next batch, and network update measures update work without
+that wait. The update timer starts after synchronizing batch readiness,
+includes forward, loss, backward, optimizer, scheduler and EMA work, and ends
+after synchronizing update completion.
+
+Startup measures the time from `train()` to the first completed update,
+including material checks, process startup and the first update, and depends
+on filesystem and compilation caches. Timed throughput includes image
+reading, preprocessing, host transport, GPU transfer, network updates,
+optimizer and EMA work. Initial setup, warm-up, evaluation and checkpoint
+writing are outside the throughput timer. RSS sums add resident memory across
+the learner and suppliers, counting a shared memory page in each process
+that maps it. The sum therefore differs from the host's physical memory
+usage. Physical GPU memory peaks were not measured.
+
+Suppliers import registration modules and construct the selected data factory
+from configuration. Define data factories at module scope in importable Python
+modules and include them in `imports`. Python callers that already imported the
+registered factory's module can use that module as well. Function-local classes,
+lambdas, interactive definitions, and sending constructed data objects with
+native readers or locks are unsupported. A script's module-level registrations
+also work: spawn reexecutes that script's top level as `__mp_main__`.
+Registrations inside its `if __name__ == "__main__":` guard do not run in the
+child. Runtime mutations of module globals (for example `MODE`) are not copied;
+the child sees the values established by executing the module. Pass such
+conditions through the data configuration or an explicit shared test/control
+file instead.
+
+A supplier inherits standard output and standard error, so `print("READY",
+flush=True)` is visible on the parent's stdout. Spawn replaces the supplier's
+standard input with the null device: reading it returns EOF and cannot wait for
+input sent to the learner. This applies to indexed reads and evaluation stream
+generators alike. Tests controlling a stalled read must use a shared file/event
+or another explicit communication channel. Guard Python script entry points
+with `if __name__ == "__main__":` when calling `train()`; YAML/CLI users need no
+entry-point changes. Keep module imports free of training launches and GPU
+allocation. The subprocesses inherit `CUDA_VISIBLE_DEVICES`; allow memory for
+one CUDA context and data resources per active supplier. They require writable
+shared host memory (Linux `/dev/shm`) in addition to pinned host memory.
+
+Only the unchanged built-in image type distributes independent jobs among
+several processes. Mutable custom data, data-owned batch samplers and videos
+keep one process owner. That owner advances material selection, sample numbers,
+clip progress and sampler RNG. The learner records only the snapshots attached
+to completed updates. Each video clip is decoded once and its unused patches
+stay with that owner across batch boundaries. A whole-video evaluation stream
+also stays with one owner, including LQ stream export.
+
+
+In-training evaluation receives a proxy for the selected data object.
+`hasattr`, `getattr` and `callable` checks expose the original data's attributes
+and methods: an indexed data type does not acquire a `stream` method or an
+explicit `__iter__` method. Python's iteration through `__getitem__` remains
+available when the original data supports that sequence protocol. Data methods
+are called in their owning process; extracting `dataset.close` does not
+transfer a bound data instance. Picklable values, sample classes and batch
+classes retain their types and attributes, including Mapping subclasses.
+Opaque native attributes stay with their owner and expose their methods through
+references.
+
+The proxy is not an instance of the registered data class. Replace
+`isinstance(dataset, MyData)` checks with the needed capability checks, such as
+`callable(getattr(dataset, "stream", None))`, or select by the registered type in
+`context["datasets"][name]["type"]`. Tensor values in returned objects and their
+attributes all use the shared host and pinned-memory transport.
+
+Initialize any
 thread-local decoder state in the thread that performs the read. A custom
 dataset used with `sample_threads > 1` must support concurrent
 `__getitem__` calls, protect shared mutable state and derive random choices from
@@ -408,7 +526,7 @@ candidates, and string lists select names. All candidates are validated.
 `gamma`; a sequence without a final color step receives Rec.709/sRGB.
 Training requires one crop marker in each branch; `patch_size` is the final GT
 size, and crop/augmentation preserve correspondence with LQ. Random choices are
-derived from the seed and global sample number, including with thread prefetch.
+derived from the seed and global sample number, including with process and thread prefetch.
 
 `value_clipping` is a **data** key, default `codec_only`: preserve negative and
 above-one scene values except at codec boundaries. `color_and_metrics` also clips
@@ -476,7 +594,7 @@ whose names begin with `.` beneath the requested directory, and does not follow
 directory symlinks. Optional `prefixes` select filenames at every depth.
 An empty selection raises an error naming the directory and extension conditions
 before updates or evaluation. Collection only checks paths and suffixes; it
-requires no GPU, codec initialization or `ffprobe`. A collected file must still
+requires no GPU or codec initialization. A collected file must still
 pass the existing indexing and decoder capability checks.
 
 ```python
@@ -502,6 +620,12 @@ It receives every selected display frame once, including a short final delivery.
 The source decoder, encoder and LQ decoder stay in one stream for that material;
 changing `frames` only changes delivery boundaries. Crop coordinates and
 compression settings are drawn once per material from its seed and material index.
+
+The stream decodes each video sequentially from the beginning. Frames before
+the start of `time_range` are also decoded and then discarded. For a fixed
+selected duration, evaluating a range later in the video takes longer because
+more frames must be decoded before its start. This extra decoding before the
+requested range does not apply when evaluating the entire video.
 
 | Evaluation data key or operation | `video_evaluation` / `VideoEvaluationDataset` | `video_stream_evaluation` / `VideoStreamEvaluationDataset` |
 | --- | --- | --- |
@@ -1133,16 +1257,29 @@ pixtreme-train train config.yaml --output runs/continued --resume runs/first/che
 ```
 
 Resume permits changes to `train.iterations` (must exceed completed updates),
-`train.device`, `train.sample_threads`, `train.supply_timeout`, `train.channels_last`,
+`train.device`, `train.sample_threads`, `train.supply_processes`, `train.supply_timeout`, `train.channels_last`,
 `train.cudnn_benchmark`, `train.compile`, and `notes`. Other settings must match the
 saved configuration, including data sources, degradation, color, batch size and
 prefetch depth. Version 2 checkpoints lacking `supply_timeout` use `600` seconds;
-those lacking `sample_threads` use `1`; missing
+those lacking `sample_threads` or `supply_processes` use `1`; missing
 network execution options mean `channels_last: false`, `cudnn_benchmark: false`,
 and `compile: null`. These options may change on resume in either direction
 without converting checkpoint weights. Model
 steps may further restrict resumption. The next sample follows the last completed
 update; unused prefetched samples are regenerated.
+
+Version 2 also records `supply_rng`, the Python, NumPy, torch and CUDA RNG
+snapshot attached to the last completed supply batch. A checkpoint without this
+optional field initializes supply from its existing `rng`; its sampler state
+continues through `rng.generators.sampler`. New runs using the same configuration
+resume supply RNG independently from learning RNG, excluding unused prefetch.
+A custom data type using global RNGs uses one sample thread; concurrent sample
+threads require sample-number-derived or explicitly managed independent RNGs.
+Custom data that relied on sharing global RNG consumption with stochastic
+updates must move to sample-number-derived randomness or its own RNG saved by
+`state_dict`. Resuming an older checkpoint splits those formerly shared global
+streams; their old interleaving is not reproduced. Number-derived built-in image
+and video choices retain their existing meaning.
 
 An omitted `train.seed` on resume uses the seed saved in the checkpoint and does
 not choose a new one. An explicitly supplied seed must match the saved value.
@@ -1170,9 +1307,15 @@ If training batch supply or evaluation data supply does not return within
 `75` (temporary failure; restart may succeed). The wait starts when the learner
 requests the next batch, even when prefetch is disabled. Evaluation bounds each
 indexed read, iteration and entry/exit/iteration of a dataset's `stream()` context;
-other custom dataset methods and evaluation calculations are outside this limit.
-Evaluation calculations and hooks stay on the learning thread; data acquisition
-inherits the caller's CUDA stream and gradient/autocast settings.
+evaluation calculations and hooks stay on the learning thread. Evaluation data
+runs in its supplier at float32. Completion of the host and GPU copies orders
+each result before the learner uses it. After each evaluation, both processes
+release evaluation data and samples to the torch/CuPy allocators. A later
+evaluation reconstructs its data from the same configuration.
+
+Process startup and data validation precede per-batch waits and are bounded by
+`max(60, train.supply_timeout)` seconds per supplier. Startup time is separate
+from the wait for an already initialized supplier's next batch.
 
 The command writes the normal `training.jsonl` containing completed updates,
 discards partial evaluation metrics, and saves the last completed update unless
@@ -1195,7 +1338,7 @@ dataset, `reason` describes the expired wait, and `checkpoint` is a `Path` to th
 saved or reused checkpoint, or `None` when none is available. After catching this
 exception, end the process and start a new process using `--resume`; do not
 continue training in that process, because the CUDA state may be unusable.
-Unfinished supply threads do not prevent the caller's process from exiting.
+Shutdown bounds its process joins and terminates a supplier that does not return. Unfinished native calls do not prevent the caller's process from exiting.
 
 ### Migration from 0.3.x
 
@@ -1203,7 +1346,7 @@ Use the following replacements when updating trainer modules and configurations:
 
 | 0.3.x usage | Current usage |
 | --- | --- |
-| `data.train.batch_size`, `data.train.prefetch_batches` or `num_workers` | Move batch size and prefetch depth to `train.batch_size` and `train.prefetch_batches`; use `train.sample_threads` for concurrent sample creation in one process. |
+| `data.train.batch_size`, `data.train.prefetch_batches` or `num_workers` | Move batch size and prefetch depth to `train.batch_size` and `train.prefetch_batches`; use `train.sample_threads` for threads within a supplier and `train.supply_processes` for independent built-in image suppliers. |
 | Top-level `degradation`/`evaluation_degradations`; `train.value_clipping` | Put each pipeline and `value_clipping` inside its data entry. Split the former `{name, seed, steps}` pipeline into `{name, seed, gt: {steps}, lq: {steps}}`; the example below shows training and named evaluations. |
 | `data.evaluation: {type: image_evaluation, ...}` | Create one `data.evaluation.<name>` entry for the training pipeline and one for each former `evaluation_degradations` pipeline; explicitly give each entry its sources and degradation. |
 | `data.train.region_size` or `ImageDegradationDataset(..., region_size=..., patch_size=...)` | Remove `region_size` from YAML and Python. Keep `patch_size` as the final GT size; place one `crop` marker in each training branch. |
@@ -1293,7 +1436,7 @@ The YAML anchor reuses the training degradation for the named `jpeg` evaluation;
 evaluation ignores its crop markers and uses the full corresponding image.
 The `clean` evaluation explicitly gets its own pipeline. `region_size` is removed.
 Old `num_workers` counted worker processes; `sample_threads` now selects threads
-within the training process, while `prefetch_batches` independently bounds batches
+within each supply process. `supply_processes` selects independent built-in image suppliers, while `prefetch_batches` bounds batches across all suppliers
 being prepared or queued. These are separate execution choices, not equivalent
 worker-count settings.
 
